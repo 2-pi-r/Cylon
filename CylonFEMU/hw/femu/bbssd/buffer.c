@@ -210,7 +210,8 @@ void buffer_clear(struct buffer *buffer)
         for (int i = 0; i < n_set; i++) {
 			if (buffer->sets[i].entry) {
 				g_tree_remove(buffer->tree, buffer->sets[i].entry);
-				flush_pg(buffer->ssd, buffer->sets[i].entry->lpn);
+				if (buffer->sets[i].entry->dirty)
+					flush_pg(buffer->ssd, buffer->sets[i].entry->lpn);
 				direct_mr_del(buffer, buffer->sets[i].entry->lpn);
 				free(buffer->sets[i].entry);
 			}
@@ -226,7 +227,8 @@ void buffer_clear(struct buffer *buffer)
 				struct buffer_entry *ent = QTAILQ_FIRST(&set->queue);
 				QTAILQ_REMOVE(&set->queue, ent, b_entry);
 				
-				flush_pg(buffer->ssd, ent->lpn);
+				if (ent->dirty)
+					flush_pg(buffer->ssd, ent->lpn);
 				g_tree_remove(buffer->tree, ent);	//remove from avl tree
 				direct_mr_del(buffer, ent->lpn);
 

@@ -25,7 +25,8 @@ int lifo_evict_victim(struct buffer *b, struct set *set)
 	// fflush(stdout);
 
 	/* Flush page to NAND */
-	flush_pg(b->ssd, victim->lpn);
+	if (victim->dirty)
+		flush_pg(b->ssd, victim->lpn);
 
 	g_tree_remove(b->tree, victim);	//remove from avl tree
 	direct_mr_del(b, victim->lpn);

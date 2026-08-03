@@ -34,7 +34,14 @@ static void process_victim(struct buffer *b, struct set* set, struct buffer_entr
     // assert(QTAILQ_PREV(victim, b_entry) == NULL);
     
     /* Flush page to NAND */
-    flush_pg(b->ssd, victim->lpn);
+    if (victim->dirty) {
+        flush_pg(b->ssd, victim->lpn);
+        /*
+         * unlike other policies (entry freed on evict), this keeps the entry
+         * alive in ghost for possible re-promotion, so dirty must be cleared here.
+         */
+        victim->dirty = false;
+    }
 
     g_tree_remove(b->tree, victim);	//remove from avl tree
     direct_mr_del(b, victim->lpn);

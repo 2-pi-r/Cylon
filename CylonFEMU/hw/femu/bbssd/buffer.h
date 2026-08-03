@@ -6,7 +6,7 @@
 typedef uint64_t lpn_t;
 struct ssd;
 
-int flush_pg(struct ssd* ssd, lpn_t lpn);
+uint64_t flush_pg(struct ssd* ssd, lpn_t lpn);
 
 extern bool ioctl_flag;
 

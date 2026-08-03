@@ -1249,10 +1249,16 @@ static void *ftl_thread(void *arg)
 }
 
 
-int flush_pg(struct ssd* ssd, lpn_t lpn)
+ /*
+ * Writeback for dirty eviction (async model).
+ * Overwriting here is the only way a PPA gets invalidated in Cylon, 
+ * so this is the only source of GC victim lines (raises line->ipc).
+ *
+ * Latency isn't charged to the requester. ssd_advance_status just
+ * occupies the LUN; later requests simply queue behind it.
+ */
+uint64_t flush_pg(struct ssd* ssd, lpn_t lpn)
 {
-    return 0;
-    
     struct ppa ppa;
     uint64_t curlat = 0, maxlat = 0;
     struct nand_lun *new_lun;
@@ -1287,7 +1293,5 @@ int flush_pg(struct ssd* ssd, lpn_t lpn)
     new_lun = get_lun(ssd, &ppa);
     new_lun->evict_endtime = new_lun->next_lun_avail_time;
 
-    maxlat = (curlat > maxlat) ? curlat : maxlat;
-// }
     return 0;
 }

@@ -30,7 +30,8 @@ int clock_evict_victim(struct buffer *b, struct set *set) {
             struct buffer_entry *next = clock_next(set, ent);
 
             /* Flush page to NAND (mirror of your FIFO path) */
-            flush_pg(b->ssd, ent->lpn);
+            if (ent->dirty)
+                flush_pg(b->ssd, ent->lpn);
 
             /* remove from auxiliary indices */
             g_tree_remove(b->tree, ent);     // remove from avl tree
