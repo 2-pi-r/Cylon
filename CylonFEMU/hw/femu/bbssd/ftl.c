@@ -1199,6 +1199,13 @@ static void *ftl_thread(void *arg)
                 if (should_gc(ssd)) {
                     do_gc(ssd, false);
                 }
+                /* Background GC may skip low-ipc lines and reclaim nothing, so free lines
+                 * can hit 0 and abort. Force-reclaim below the high threshold. */
+                while (should_gc_high(ssd)) {
+                    /* perform GC here until !should_gc(ssd) */
+                    if (do_gc(ssd, true) == -1)
+                        break;
+                }
             }
         }
 
