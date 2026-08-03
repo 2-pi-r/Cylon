@@ -173,7 +173,7 @@ bool buffer_insert_entry(struct buffer *b, struct buffer_entry *bentry, int pref
 	if (prefetch == INSERT_PREFETCH) {
 		// printf("[FEMU CXL] Prefetch start: lpn: %lx, prefetch: %lx - %lx\n",(*bentry)->lpn, start_lpn, end_lpn-1);
 		for(lpn = start_lpn; lpn < end_lpn; lpn++){
-			if (!valid_lpn(b->ssd, lpn))
+			if (!valid_user_lpn(b->ssd, lpn))
 				continue;
 
 			pbentry = buffer_lookup_entry(b, lpn);

@@ -258,9 +258,16 @@ struct ssd {
 void ssd_init(FemuCtrl *n);
 void ssd_reset(FemuCtrl *n);
 
+/* valid including OP region */
 static inline bool valid_lpn(struct ssd *ssd, lpn_t lpn)
 {
     return (lpn < ssd->sp.tt_pgs);
+}
+
+/* valid within user-exposed capacity only (excludes OP) */
+static inline bool valid_user_lpn(struct ssd *ssd, lpn_t lpn)
+{
+    return (lpn < (ssd->b->size >> 12));
 }
 
 // int flush_pg(struct ssd* ssd, lpn_t lpn);

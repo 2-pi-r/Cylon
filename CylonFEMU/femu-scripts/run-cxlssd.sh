@@ -38,25 +38,31 @@ ssd_size=$1		# in MegaBytes
 bufsz=$((ssd_size/20))
 skip_ftl=0
 
-# 96GB
+
+# blks_per_pl = raw NAND capacity, ssd_size = capacity exposed to the VM
+# OP (over-provisioning) is needed to reserve spare pages for GC
+# since Cylon's cxl_warmup writes the full capacity during setup.
+# OP only grows FTL metadata, not actual memory (based on ssd_size).
+
+# 96GB (raw 108GB, OP 12.5%)
 if [ $ssd_size -eq 98304 ]
 then
     secsz=512		
     secs_per_pg=8
     pgs_per_blk=256
-    blks_per_pl=1536
+    blks_per_pl=1728    # OP (blks_per_pl > ssd_size)
     pls_per_lun=1       # still not support multiplanes		
     luns_per_ch=8		
     nchs=8  			
 fi
 
-# 48GB
+# 48GB (raw 54GB, OP 12.5%)
 if [ $ssd_size -eq 49152 ]
 then
     secsz=512		
     secs_per_pg=8
     pgs_per_blk=256
-    blks_per_pl=768
+    blks_per_pl=864     # OP (blks_per_pl > ssd_size)
     pls_per_lun=1       # still not support multiplanes		
     luns_per_ch=8		
     nchs=8  			
