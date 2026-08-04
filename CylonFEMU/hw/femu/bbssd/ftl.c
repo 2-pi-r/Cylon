@@ -825,7 +825,7 @@ static int do_gc(struct ssd *ssd, bool force)
     }
 
     ppa.g.blk = victim_line->id;
-    ftl_log("GC-ing line:%d,ipc=%d,victim=%d,full=%d,free=%d\n", ppa.g.blk,
+    ftl_err("GC-ing line:%d,ipc=%d,victim=%d,full=%d,free=%d\n", ppa.g.blk,
               victim_line->ipc, ssd->lm.victim_line_cnt, ssd->lm.full_line_cnt,
               ssd->lm.free_line_cnt);
 
@@ -1264,11 +1264,21 @@ static void *ftl_thread(void *arg)
  * Latency isn't charged to the requester. ssd_advance_status just
  * occupies the LUN; later requests simply queue behind it.
  */
+/* XXX debug: 0이면 매 호출 출력. 첫 호출은 값과 무관하게 항상 찍힌다 */
+#define FLUSH_PG_LOG_MASK 0xFFFF
+
 uint64_t flush_pg(struct ssd* ssd, lpn_t lpn)
 {
     struct ppa ppa;
     uint64_t curlat = 0, maxlat = 0;
     struct nand_lun *new_lun;
+    static uint64_t wb_cnt;     /* XXX debug */
+
+    wb_cnt++;
+    if (wb_cnt == 1 || (wb_cnt & FLUSH_PG_LOG_MASK) == 0)
+        ftl_err("writeback=%lu lpn=%lu free_line=%d victim=%d full=%d\n",
+                wb_cnt, lpn, ssd->lm.free_line_cnt,
+                ssd->lm.victim_line_cnt, ssd->lm.full_line_cnt);
 
     ppa = get_maptbl_ent(ssd, lpn);
     if (mapped_ppa(&ppa)) {
