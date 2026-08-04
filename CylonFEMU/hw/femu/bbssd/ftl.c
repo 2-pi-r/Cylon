@@ -1,6 +1,5 @@
-#include "ftl.h"
-
 #define FEMU_DEBUG_FTL
+#include "ftl.h"
 
 static void *ftl_thread(void *arg);
 
@@ -825,7 +824,7 @@ static int do_gc(struct ssd *ssd, bool force)
     }
 
     ppa.g.blk = victim_line->id;
-    ftl_err("GC-ing line:%d,ipc=%d,victim=%d,full=%d,free=%d\n", ppa.g.blk,
+    ftl_debug("GC-ing line:%d,ipc=%d,victim=%d,full=%d,free=%d\n", ppa.g.blk,
               victim_line->ipc, ssd->lm.victim_line_cnt, ssd->lm.full_line_cnt,
               ssd->lm.free_line_cnt);
 
@@ -1276,7 +1275,7 @@ uint64_t flush_pg(struct ssd* ssd, lpn_t lpn)
 
     wb_cnt++;
     if (wb_cnt == 1 || (wb_cnt & FLUSH_PG_LOG_MASK) == 0)
-        ftl_err("writeback=%lu lpn=%lu free_line=%d victim=%d full=%d\n",
+        ftl_debug("writeback=%lu lpn=%lu free_line=%d victim=%d full=%d\n",
                 wb_cnt, lpn, ssd->lm.free_line_cnt,
                 ssd->lm.victim_line_cnt, ssd->lm.full_line_cnt);
 

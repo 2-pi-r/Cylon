@@ -168,11 +168,18 @@ static uint16_t cxlssd_admin_cmd(FemuCtrl *n, NvmeCmd *cmd)
 }
 
 static void wait_for_buf_update(FemuCtrl *n, uint64_t addr, int c)
-{   
+{
     int rc;
     uint64_t now = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
     lpn_t lpn = addr >> 12;
-    
+
+    /* XXX debug: 트랩이 FEMU까지 오는 횟수. 첫 회 + 1M회마다 */
+    static uint64_t acc_cnt;
+    acc_cnt++;
+    if (acc_cnt == 1 || (acc_cnt & 0xFFFFF) == 0)
+        femu_err("cxl_acc=%lu lpn=%lu %s\n", acc_cnt, lpn,
+                 (c == CXL_READ) ? "R" : "W");
+
     struct nand_cmd cmd = (struct nand_cmd) {
         .type = USER_IO,
         .cmd = c,
