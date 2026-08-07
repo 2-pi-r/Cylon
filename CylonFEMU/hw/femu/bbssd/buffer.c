@@ -189,6 +189,27 @@ bool buffer_insert_entry(struct buffer *b, struct buffer_entry *bentry, int pref
 }
 
 
+/*
+ * Remove the entry for this LPN from the cache, if present (TRIM only).
+ * If left in place, the next access would be treated as a cache hit (zero
+ * latency), and a later eviction would remap the LPN via flush_pg(),
+ * effectively undoing the TRIM.
+ */
+bool buffer_remove_entry(struct buffer *b, lpn_t lpn)
+{
+	struct buffer_entry *ent;
+
+	if (b->size == 0 || !b->ops.remove_entry)
+		return false;
+
+	ent = buffer_lookup_entry(b, lpn);
+	if (!ent)
+		return false;
+
+	return b->ops.remove_entry(b, ent) > 0;
+}
+
+
 static int comp_buffer(const void *a, const void *b){
 	return ((struct buffer_entry*)a)->lpn - ((struct buffer_entry*)b)->lpn;
 }

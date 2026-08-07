@@ -403,18 +403,22 @@ static void buffer_init(struct ssd *ssd)
 	case LIFO:
 		buffer->ops.evict_victim = lifo_evict_victim;
 		buffer->ops.insert_entry = lifo_insert_entry;
+		buffer->ops.remove_entry = lifo_remove_entry;
 		break;
 	case FIFO:
 		buffer->ops.evict_victim = fifo_evict_victim;
 		buffer->ops.insert_entry = fifo_insert_entry;
+		buffer->ops.remove_entry = fifo_remove_entry;
 		break;
     case CLOCK:
 		buffer->ops.evict_victim = clock_evict_victim;
 		buffer->ops.insert_entry = clock_insert_entry;
+		buffer->ops.remove_entry = NULL;    /* TRIM unsupported */
 		break;
     case S3FIFO:
         buffer->ops.evict_victim = s3fifo_evict_victim;
 		buffer->ops.insert_entry = s3fifo_insert_entry;
+		buffer->ops.remove_entry = NULL;    /* TRIM unsupported */
 		break;
 	default:
 		femu_err("unknown replacement policy\n");
@@ -1073,6 +1077,30 @@ static uint64_t ssd_write(struct ssd *ssd, NvmeRequest *req)
 // }
 
 
+/*
+ * TRIM: invalidate an LPN the host has told us it no longer uses.
+ * mark_page_invalid() bumps the invalid-page count (ipc) and moves the line
+ * onto the victim queue, so the invalid page created here becomes something
+ * GC can reclaim.
+ * Touches FTL state, so this must only ever be called from the FTL thread.
+ */
+static void ftl_trim(struct ssd *ssd, lpn_t lpn)
+{
+    struct ppa ppa = get_maptbl_ent(ssd, lpn);
+
+    if (mapped_ppa(&ppa)) {
+        struct ppa unmapped;
+
+        mark_page_invalid(ssd, &ppa);
+        set_rmap_ent(ssd, INVALID_LPN, &ppa);
+
+        unmapped.ppa = UNMAPPED_PPA;
+        set_maptbl_ent(ssd, lpn, &unmapped);
+    }
+
+    buffer_remove_entry(&ssd->dram_buffer, lpn);
+}
+
 static void *ftl_thread(void *arg)
 {
     FemuCtrl *n = (FemuCtrl *)arg;
@@ -1117,6 +1145,21 @@ static void *ftl_thread(void *arg)
                     printf("FEMU: FTL cxl_req dequeue failed\n");
                 }
                 assert(creq != NULL);
+
+                /* Must work regardless of LSA_TROLL, so this lives outside the switch below */
+                if (creq->ncmd->cmd == CXL_TRIM) {
+                    for (int ti = 0; ti < creq->trim_cnt; ti++) {
+                        const struct cylon_trim_ent *e = &creq->trim_ents[ti];
+
+                        for (uint32_t k = 0; k < e->nr_pages; k++)
+                            ftl_trim(ssd, e->start_lpn + k);
+                    }
+                    rc = femu_ring_enqueue(ssd->cxl_resp, (void *)&creq, 1);
+                    if (rc != 1) {
+                        ftl_err("FTL cxl_resp enqueue failed (TRIM)\n");
+                    }
+                    continue;
+                }
 #ifdef LSA_TROLL
                 switch (creq->ncmd->cmd) {
                 case BUF_PRINT_STAT:

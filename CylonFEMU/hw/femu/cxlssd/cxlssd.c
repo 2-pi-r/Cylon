@@ -1,3 +1,4 @@
+#define FEMU_DEBUG_FTL
 #include "../nvme.h"
 #include "../bbssd/ftl.h"
 #include "../kvm_ext.h"
@@ -420,22 +421,32 @@ static MemTxResult cxlssd_mem_write(void *opaque, uint64_t addr, uint64_t data, 
     return MEMTX_OK;
 }
 
-#ifdef LSA_TROLL
-static void req_ftl(FemuCtrl *n, int c)
-{   
+/*
+ * Send one command to the FTL thread and block until it completes.
+ * FTL state such as maptbl and the line lists is owned solely by the FTL
+ * thread, so the vCPU thread handling the mailbox delegates through this
+ * ring instead of touching it directly.
+ * Since this blocks until completion, the mailbox payload that `ents` points
+ * to stays valid for the duration - no copy needed.
+ */
+static void req_ftl_cmd(FemuCtrl *n, int c,
+                        const struct cylon_trim_ent *ents, int cnt)
+{
     int rc;
     struct nand_cmd cmd = (struct nand_cmd) {
         .type = USER_IO,
         .cmd = c,
         .stime = 0,
     };
-    
+
     struct cxl_req creq = (struct cxl_req) {
         .ncmd = &cmd,
         .lpn = 0,
+        .trim_ents = ents,
+        .trim_cnt = cnt,
         .expire_time = 0,
     };
-    
+
     struct cxl_req *myreq = &creq;
     struct cxl_req *req = NULL;
 
@@ -472,6 +483,55 @@ static void req_ftl(FemuCtrl *n, int c)
             break;
         }
     }
+}
+
+/* Command code carried in the SET_LSA mailbox command's offset field ("TRM\0") */
+#define CYLON_TRIM_MAGIC 0x54524D00ULL
+
+/*
+ * Handle the TRIM command. The payload is an array of struct cylon_trim_ent.
+ * A return value of 0 means "handled as a command, do not write the payload
+ * to device memory" - hw/mem/cxl_type3.c's set_lsa() checks this and skips
+ * the media write.
+ */
+static uint16_t cxlssd_trim(FemuCtrl *n, const void *buf, uint64_t size)
+{
+    const struct cylon_trim_ent *ents = buf;
+    uint64_t nr_lpns = n->mbe->size >> 12;
+    int cnt, i;
+
+    /* Reject on policies that don't support entry removal (CLOCK/S3FIFO) */
+    if (!n->ssd->dram_buffer.ops.remove_entry) {
+        femu_err("TRIM: replacement policy has no remove_entry, rejected\n");
+        return 0;
+    }
+
+    if (size == 0 || (size % sizeof(struct cylon_trim_ent)) != 0) {
+        femu_err("TRIM: bad payload size %lu\n", size);
+        return 0;
+    }
+    cnt = size / sizeof(struct cylon_trim_ent);
+
+    /* An out-of-range LPN would index past the maptbl array, so reject the
+     * whole batch if even one entry is out of bounds */
+    for (i = 0; i < cnt; i++) {
+        uint64_t end = (uint64_t)ents[i].start_lpn + ents[i].nr_pages;
+
+        if (end > nr_lpns) {
+            femu_err("TRIM: range out of bounds (start=%u nr=%u, max=%lu)\n",
+                     ents[i].start_lpn, ents[i].nr_pages, nr_lpns);
+            return 0;
+        }
+    }
+
+    req_ftl_cmd(n, CXL_TRIM, ents, cnt);
+    return 0;
+}
+
+#ifdef LSA_TROLL
+static void req_ftl(FemuCtrl *n, int c)
+{
+    req_ftl_cmd(n, c, NULL, 0);
 }
 #endif
 
@@ -606,6 +666,15 @@ static uint16_t get_lsa(struct FemuCtrl *n, void *buf, uint64_t size, uint64_t o
 }
 static uint16_t set_lsa(struct FemuCtrl *n, const void *buf, uint64_t size, uint64_t offset) {
     // printf("set_lsa: offset:%lx, buf:%lx, size:%lx\n", offset, (uint64_t)buf, size);
+
+    /*
+     * Repurpose offset as a command code. If handled as a command, we must
+     * return here - falling through to the memcpy below would overwrite the
+     * payload onto device memory at that offset, corrupting guest data.
+     */
+    if (offset == CYLON_TRIM_MAGIC)
+        return cxlssd_trim(n, buf, size);
+
 
     // if (size == 13) {
     //     char *data = (char *)buf;

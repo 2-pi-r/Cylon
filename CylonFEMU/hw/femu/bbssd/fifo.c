@@ -37,6 +37,34 @@ int fifo_evict_victim(struct buffer *b, struct set *set)
 	return 1;
 }
 
+/*
+ * Remove one specific entry from the cache (TRIM only).
+ * Unlike evict, this does not call flush_pg - the whole point of TRIM is to
+ * discard the data.
+ */
+int fifo_remove_entry(struct buffer *b, struct buffer_entry *ent)
+{
+	struct set *set = buffer_get_set(b, ent->lpn);
+
+	if (b->way == WAY_1) {
+		if (set->entry != ent)
+			return -1;
+		set->entry = NULL;
+	}
+	else {
+		QTAILQ_REMOVE(&set->queue, ent, b_entry);
+	}
+
+	g_tree_remove(b->tree, ent);
+	direct_mr_del(b, ent->lpn);
+
+	free(ent);
+	b->entry_cnt--;
+	set->cnt--;
+
+	return 1;
+}
+
 // static int a = 1;
 int fifo_insert_entry(struct buffer *b, struct buffer_entry *eptr)
 {

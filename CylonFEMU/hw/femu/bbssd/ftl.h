@@ -217,12 +217,24 @@ enum {
     BUF_CLEAR,
     SSD_INIT,
     INC_PREFETCH_DEGREE,
+    CXL_TRIM,
+};
+
+/* A TRIM range. The mailbox payload carries an array of this struct. */
+struct cylon_trim_ent {
+    uint32_t start_lpn;
+    uint32_t nr_pages;
 };
 
 struct cxl_req {
     /* request */
     struct nand_cmd *ncmd;
     lpn_t lpn;
+
+    /* CXL_TRIM only. The issuing thread blocks until completion, so we point
+     * at the mailbox payload instead of copying it. */
+    const struct cylon_trim_ent *trim_ents;
+    int trim_cnt;
 
     /* response */
     uint64_t expire_time;

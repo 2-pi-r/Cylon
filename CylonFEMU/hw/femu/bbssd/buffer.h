@@ -37,6 +37,12 @@ struct buffer_entry {
 struct buffer_ops {
     int (*evict_victim)(struct buffer *, struct set *);
     int (*insert_entry)(struct buffer *, struct buffer_entry *);
+    /*
+     * Remove one specific entry (TRIM only). evict_victim only removes whichever
+     * victim the policy itself picks, so it can't target a specific LPN.
+     * NULL for unsupported policies (CLOCK/S3FIFO); callers check this and reject TRIM.
+     */
+    int (*remove_entry)(struct buffer *, struct buffer_entry *);
 };
 
 struct set {  
@@ -136,6 +142,7 @@ struct set* buffer_get_set(struct buffer *b, lpn_t lpn);
 // struct buffer_entry* buffer_select_victim(struct buffer *);
 // bool buffer_evict_victim(struct buffer *, struct buffer_entry *);
 bool buffer_insert_entry(struct buffer *, struct buffer_entry *, int);
+bool buffer_remove_entry(struct buffer *, lpn_t);
 void buffer_clear(struct buffer *);
 void buffer_init_set(struct buffer *);
 void buffer_destroy_set(struct buffer *);
@@ -146,10 +153,12 @@ void buffer_destroy_set(struct buffer *);
 /* LIFO */
 int lifo_evict_victim(struct buffer *, struct set *);
 int lifo_insert_entry(struct buffer *, struct buffer_entry *);
+int lifo_remove_entry(struct buffer *, struct buffer_entry *);
 
 /* FIFO */
 int fifo_evict_victim(struct buffer *, struct set *);
 int fifo_insert_entry(struct buffer *, struct buffer_entry *);
+int fifo_remove_entry(struct buffer *, struct buffer_entry *);
 
 /* CLOCK (second chance)*/
 int clock_evict_victim(struct buffer *, struct set *);

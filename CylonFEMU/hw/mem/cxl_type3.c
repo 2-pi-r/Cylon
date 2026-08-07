@@ -1068,7 +1068,9 @@ static void set_lsa(CXLType3Dev *ct3d, const void *buf, uint64_t size,
 
     validate_lsa_access(mr, size, offset);
     if (ct3d->femu) {
-        ct3d->femu->cxl_mem_ops.set_lsa(ct3d->femu, buf, size, offset);
+        /* 0 = FEMU handled this as a control command; do not write the payload to media */
+        if (ct3d->femu->cxl_mem_ops.set_lsa(ct3d->femu, buf, size, offset) == 0)
+            return;
     }
 
     lsa = memory_region_get_ram_ptr(mr) + offset;
