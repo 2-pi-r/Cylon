@@ -174,11 +174,11 @@ static void wait_for_buf_update(FemuCtrl *n, uint64_t addr, int c)
     uint64_t now = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
     lpn_t lpn = addr >> 12;
 
-    /* XXX debug: 트랩이 FEMU까지 오는 횟수. 첫 회 + 1M회마다 */
+    /* XXX (wonjoo): 트랩이 FEMU까지 오는 횟수. 첫 회 + 1M회마다 */
     static uint64_t acc_cnt;
     acc_cnt++;
     if (acc_cnt == 1 || (acc_cnt & 0xFFFFF) == 0)
-        femu_err("cxl_acc=%lu lpn=%lu %s\n", acc_cnt, lpn,
+        ftl_debug("femu_access=%lu lpn=%lu %s\n", acc_cnt, lpn,
                  (c == CXL_READ) ? "R" : "W");
 
     struct nand_cmd cmd = (struct nand_cmd) {
@@ -422,12 +422,9 @@ static MemTxResult cxlssd_mem_write(void *opaque, uint64_t addr, uint64_t data, 
 }
 
 /*
- * Send one command to the FTL thread and block until it completes.
- * FTL state such as maptbl and the line lists is owned solely by the FTL
- * thread, so the vCPU thread handling the mailbox delegates through this
- * ring instead of touching it directly.
- * Since this blocks until completion, the mailbox payload that `ents` points
- * to stays valid for the duration - no copy needed.
+ * Delegates through the ring because FTL state (maptbl, line lists) is
+ * owned solely by the FTL thread. Blocks until completion, so `ents` -
+ * which points into the mailbox payload - stays valid without a copy.
  */
 static void req_ftl_cmd(FemuCtrl *n, int c,
                         const struct cylon_trim_ent *ents, int cnt)
@@ -489,10 +486,9 @@ static void req_ftl_cmd(FemuCtrl *n, int c,
 #define CYLON_TRIM_MAGIC 0x54524D00ULL
 
 /*
- * Handle the TRIM command. The payload is an array of struct cylon_trim_ent.
- * A return value of 0 means "handled as a command, do not write the payload
- * to device memory" - hw/mem/cxl_type3.c's set_lsa() checks this and skips
- * the media write.
+ * Payload is an array of struct cylon_trim_ent. Returning 0 tells
+ * hw/mem/cxl_type3.c's set_lsa() to skip writing the payload to media,
+ * since it was consumed as a command instead.
  */
 static uint16_t cxlssd_trim(FemuCtrl *n, const void *buf, uint64_t size)
 {
