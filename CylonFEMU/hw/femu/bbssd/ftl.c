@@ -1,4 +1,4 @@
-#define FEMU_DEBUG_FTL
+// #define FEMU_DEBUG_FTL
 #include "ftl.h"
 
 static void *ftl_thread(void *arg);
@@ -1148,22 +1148,12 @@ static void *ftl_thread(void *arg)
 
                 /* Must work regardless of LSA_TROLL, so this lives outside the switch below */
                 if (creq->ncmd->cmd == CXL_TRIM) {
-                    int free_before = ssd->lm.free_line_cnt; // XXX (wonjoo)
-                    int victim_before = ssd->lm.victim_line_cnt; // XXX (wonjoo)
-                    uint64_t total_pages = 0; // XXX (wonjoo)
-
                     for (int ti = 0; ti < creq->trim_cnt; ti++) {
                         const struct cylon_trim_ent *e = &creq->trim_ents[ti];
 
                         for (uint32_t k = 0; k < e->nr_pages; k++)
                             ftl_trim(ssd, e->start_lpn + k);
-                        total_pages += e->nr_pages; // XXX (wonjoo)
                     }
-
-                    ftl_debug("[TRIM] entries=%d pages=%lu free_line %d->%d victim_line %d->%d\n",
-                            creq->trim_cnt, total_pages,
-                            free_before, ssd->lm.free_line_cnt,
-                            victim_before, ssd->lm.victim_line_cnt); // XXX (wonjoo)
 
                     rc = femu_ring_enqueue(ssd->cxl_resp, (void *)&creq, 1);
                     if (rc != 1) {
@@ -1323,13 +1313,6 @@ uint64_t flush_pg(struct ssd* ssd, lpn_t lpn)
     uint64_t curlat = 0, maxlat = 0;
     struct nand_lun *new_lun;
 
-    /* XXX (wonjoo): 캐시 dirty eviction writeback 횟수. 첫 회 + 1M회마다 */
-    static uint64_t wb_cnt;
-    wb_cnt++;
-    if (wb_cnt == 1 || (wb_cnt & 0xFFFFF) == 0)
-        ftl_debug("writeback=%lu lpn=%lu free_line=%d victim=%d full=%d\n",
-                wb_cnt, lpn, ssd->lm.free_line_cnt,
-                ssd->lm.victim_line_cnt, ssd->lm.full_line_cnt);
 
     ppa = get_maptbl_ent(ssd, lpn);
     if (mapped_ppa(&ppa)) {
