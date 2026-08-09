@@ -18,9 +18,23 @@ static inline struct ppa get_maptbl_ent(struct ssd *ssd, lpn_t lpn)
     return ssd->maptbl[lpn];
 }
 
+static inline bool mapped_ppa(struct ppa *ppa)
+{
+    return !(ppa->ppa == UNMAPPED_PPA);
+}
+
+/*
+ * Creating or destroying a mapping is the only thing that moves live_pages;
+ * writebacks and GC copies remap an already-live LPN, so hooking
+ * mark_page_valid() instead would over-count by every GC copy.
+ */
 static inline void set_maptbl_ent(struct ssd *ssd, lpn_t lpn, struct ppa *ppa)
 {
     ftl_assert(lpn < ssd->sp.tt_pgs);
+
+    if (mapped_ppa(&ssd->maptbl[lpn]) != mapped_ppa(ppa))
+        ssd->stats.live_pages += mapped_ppa(ppa) ? 1 : -1;
+
     ssd->maptbl[lpn] = *ppa;
 }
 
@@ -362,6 +376,113 @@ static void ssd_init_rmap(struct ssd *ssd)
     }
 }
 
+static void ssd_init_stats(struct ssd *ssd)
+{
+    struct ssd_stats *st = &ssd->stats;
+
+    st->gc_copy_cnt = g_malloc0(sizeof(uint16_t) * ssd->sp.tt_pgs);
+    st->samples = g_malloc0(sizeof(struct ssd_stats_sample) *
+                            SSD_STATS_SAMPLE_MAX);
+}
+
+/* Called once per CXL request rather than per page, to keep the period check
+ * off the per-page write and GC paths. */
+static void ssd_stats_sample(struct ssd *ssd)
+{
+    struct ssd_stats *st = &ssd->stats;
+    uint64_t w_host = st->w_first_touch + st->w_writeback;
+
+    if (w_host < st->next_sample_w_host)
+        return;
+    st->next_sample_w_host = w_host + SSD_STATS_SAMPLE_PERIOD;
+
+    if (st->nr_samples >= SSD_STATS_SAMPLE_MAX)
+        return;
+
+    st->samples[st->nr_samples++] = (struct ssd_stats_sample) {
+        .time_ns         = qemu_clock_get_ns(QEMU_CLOCK_REALTIME),
+        .w_host          = w_host,
+        .w_gc            = st->w_gc,
+        .gc_lines        = st->gc_lines,
+        .gc_lines_forced = st->gc_lines_forced,
+        .live_pages      = st->live_pages,
+        .free_lines      = ssd->lm.free_line_cnt,
+    };
+}
+
+static void ssd_stats_reset(struct ssd *ssd)
+{
+    struct ssd_stats *st = &ssd->stats;
+
+    st->w_first_touch = st->w_writeback = st->w_gc = 0;
+    st->gc_lines = st->gc_lines_forced = st->gc_forced_novictim = 0;
+    st->nr_samples = 0;
+    st->next_sample_w_host = 0;
+    memset(st->gc_copy_cnt, 0, sizeof(uint16_t) * ssd->sp.tt_pgs);
+
+    /* live_pages is current device state, not an event count, so it survives */
+}
+
+/*
+ * Time series to <base>.csv, per-LPN GC copy counts to <base>.gc_copy_cnt.bin
+ * (raw uint16 array indexed by LPN). Base path defaults to /tmp/cylon_ssd_stats,
+ * override with $CYLON_STATS_PATH. The guest issues this at the end of a
+ * measurement window, so the file I/O here perturbs nothing that is measured.
+ */
+static void ssd_stats_dump(struct ssd *ssd)
+{
+    struct ssd_stats *st = &ssd->stats;
+    uint64_t w_host = st->w_first_touch + st->w_writeback;
+    const char *base = getenv("CYLON_STATS_PATH");
+    char path[256];
+    FILE *f;
+
+    if (!base)
+        base = "/tmp/cylon_ssd_stats";
+
+    ftl_log("stats w_first_touch=%lu w_writeback=%lu w_gc=%lu nand_write=%lu "
+            "waf=%.4f gc_lines=%lu gc_lines_forced=%lu gc_forced_novictim=%lu "
+            "live_pages=%lu tt_pgs=%d u=%.4f\n",
+            st->w_first_touch, st->w_writeback, st->w_gc, w_host + st->w_gc,
+            w_host ? (double)(w_host + st->w_gc) / w_host : 0.0,
+            st->gc_lines, st->gc_lines_forced, st->gc_forced_novictim,
+            st->live_pages, ssd->sp.tt_pgs,
+            (double)st->live_pages / ssd->sp.tt_pgs);
+
+    if (st->nr_samples >= SSD_STATS_SAMPLE_MAX)
+        ftl_err("stats dump: sample buffer full, time series truncated at %d\n",
+                st->nr_samples);
+
+    snprintf(path, sizeof(path), "%s.csv", base);
+    f = fopen(path, "w");
+    if (!f) {
+        ftl_err("stats dump: cannot open %s\n", path);
+        return;
+    }
+    fprintf(f, "time_ns,w_host,w_gc,gc_lines,gc_lines_forced,live_pages,"
+               "free_lines\n");
+    for (int i = 0; i < st->nr_samples; i++) {
+        struct ssd_stats_sample *s = &st->samples[i];
+
+        fprintf(f, "%lu,%lu,%lu,%lu,%lu,%lu,%lu\n", s->time_ns, s->w_host,
+                s->w_gc, s->gc_lines, s->gc_lines_forced, s->live_pages,
+                s->free_lines);
+    }
+    fclose(f);
+
+    snprintf(path, sizeof(path), "%s.gc_copy_cnt.bin", base);
+    f = fopen(path, "w");
+    if (!f) {
+        ftl_err("stats dump: cannot open %s\n", path);
+        return;
+    }
+    fwrite(st->gc_copy_cnt, sizeof(uint16_t), ssd->sp.tt_pgs, f);
+    fclose(f);
+
+    ftl_log("stats dumped to %s.csv / %s.gc_copy_cnt.bin (%d samples)\n",
+            base, base, st->nr_samples);
+}
+
 static int comp_buffer(const void *a, const void *b){
 	return ((struct buffer_entry*)a)->lpn - ((struct buffer_entry*)b)->lpn;
 }
@@ -474,6 +595,8 @@ void ssd_init(FemuCtrl *n)
     /* initialize write pointer, this is how we allocate new pages for writes */
     ssd_init_write_pointer(ssd);
 
+    ssd_init_stats(ssd);
+
     if (n->bufsz)
         ssd_init_buffer(n);
     printf("\n###########\b, read_lat: %d\n", ssd->sp.pg_rd_lat);
@@ -505,11 +628,6 @@ static bool valid_ppa(struct ssd *ssd, struct ppa *ppa)
         return true;
 
     return false;
-}
-
-static inline bool mapped_ppa(struct ppa *ppa)
-{
-    return !(ppa->ppa == UNMAPPED_PPA);
 }
 
 static inline struct ssd_channel *get_ch(struct ssd *ssd, struct ppa *ppa)
@@ -735,6 +853,10 @@ static uint64_t gc_write_page(struct ssd *ssd, struct ppa *old_ppa)
 
     mark_page_valid(ssd, &new_ppa);
 
+    ssd->stats.w_gc++;
+    if (ssd->stats.gc_copy_cnt[lpn] < UINT16_MAX)
+        ssd->stats.gc_copy_cnt[lpn]++;
+
     /* need to advance the write pointer here */
     ssd_advance_write_pointer(ssd);
 
@@ -824,8 +946,14 @@ static int do_gc(struct ssd *ssd, bool force)
 
     victim_line = select_victim_line(ssd, force);
     if (!victim_line) {
+        if (force)
+            ssd->stats.gc_forced_novictim++;
         return -1;
     }
+
+    ssd->stats.gc_lines++;
+    if (force)
+        ssd->stats.gc_lines_forced++;
 
     ppa.g.blk = victim_line->id;
     ftl_debug("GC-ing line:%d,ipc=%d,victim=%d,full=%d,free=%d\n", ppa.g.blk,
@@ -1161,6 +1289,21 @@ static void *ftl_thread(void *arg)
                     }
                     continue;
                 }
+
+                /* Counters are FTL-thread-owned, so reset/dump run here too */
+                if (creq->ncmd->cmd == CXL_STATS_RESET ||
+                    creq->ncmd->cmd == CXL_STATS_DUMP) {
+                    if (creq->ncmd->cmd == CXL_STATS_RESET)
+                        ssd_stats_reset(ssd);
+                    else
+                        ssd_stats_dump(ssd);
+
+                    rc = femu_ring_enqueue(ssd->cxl_resp, (void *)&creq, 1);
+                    if (rc != 1) {
+                        ftl_err("FTL cxl_resp enqueue failed (STATS)\n");
+                    }
+                    continue;
+                }
 #ifdef LSA_TROLL
                 switch (creq->ncmd->cmd) {
                 case BUF_PRINT_STAT:
@@ -1228,6 +1371,7 @@ static void *ftl_thread(void *arg)
 
                         mark_page_valid(ssd, &new_ppa);
                         ssd_advance_write_pointer(ssd);
+                        ssd->stats.w_first_touch++;
 
                         creq->ncmd->cmd = NAND_WRITE;
                         lat += ssd_advance_status(ssd, &new_ppa, creq->ncmd);
@@ -1249,6 +1393,8 @@ static void *ftl_thread(void *arg)
                     if (do_gc(ssd, true) == -1)
                         break;
                 }
+
+                ssd_stats_sample(ssd);
             }
         }
 
@@ -1313,6 +1459,7 @@ uint64_t flush_pg(struct ssd* ssd, lpn_t lpn)
     uint64_t curlat = 0, maxlat = 0;
     struct nand_lun *new_lun;
 
+    ssd->stats.w_writeback++;
 
     ppa = get_maptbl_ent(ssd, lpn);
     if (mapped_ppa(&ppa)) {

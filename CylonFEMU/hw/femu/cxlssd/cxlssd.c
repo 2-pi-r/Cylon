@@ -478,6 +478,11 @@ static void req_ftl_cmd(FemuCtrl *n, int c,
 /* Command code carried in the SET_LSA mailbox command's offset field ("TRM\0") */
 #define CYLON_TRIM_MAGIC 0x54524D00ULL
 
+/* Same channel: reset the counters at the start of a measurement window, dump
+ * them at the end. Payload is unused. ("STR\0" / "STD\0") */
+#define CYLON_STATS_RESET_MAGIC 0x53545200ULL
+#define CYLON_STATS_DUMP_MAGIC  0x53544400ULL
+
 /*
  * Payload is an array of struct cylon_trim_ent. Returning 0 tells
  * hw/mem/cxl_type3.c's set_lsa() to skip writing the payload to media,
@@ -663,6 +668,16 @@ static uint16_t set_lsa(struct FemuCtrl *n, const void *buf, uint64_t size, uint
      */
     if (offset == CYLON_TRIM_MAGIC)
         return cxlssd_trim(n, buf, size);
+
+    if (offset == CYLON_STATS_RESET_MAGIC) {
+        req_ftl_cmd(n, CXL_STATS_RESET, NULL, 0);
+        return 0;
+    }
+
+    if (offset == CYLON_STATS_DUMP_MAGIC) {
+        req_ftl_cmd(n, CXL_STATS_DUMP, NULL, 0);
+        return 0;
+    }
 
 
     // if (size == 13) {

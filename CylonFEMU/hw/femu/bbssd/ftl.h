@@ -218,6 +218,50 @@ enum {
     SSD_INIT,
     INC_PREFETCH_DEGREE,
     CXL_TRIM,
+    CXL_STATS_RESET,
+    CXL_STATS_DUMP,
+};
+
+/* Sampling period in host writes, and the cap on samples held in memory */
+#define SSD_STATS_SAMPLE_PERIOD (1 << 12)
+#define SSD_STATS_SAMPLE_MAX    (1 << 18)
+
+struct ssd_stats_sample {
+    uint64_t time_ns;
+    uint64_t w_host;
+    uint64_t w_gc;
+    uint64_t gc_lines;
+    uint64_t gc_lines_forced;
+    uint64_t live_pages;
+    uint64_t free_lines;
+};
+
+struct ssd_stats {
+    /* NAND page programs by trigger. w_first_touch is the allocation done on the
+     * first access to an unmapped LPN, so even a read programs a page; it should
+     * stay flat after warm-up, otherwise the measured window isn't warmed up. */
+    uint64_t w_first_touch;
+    uint64_t w_writeback;      /* dirty buffer eviction */
+    uint64_t w_gc;             /* GC valid-page copies */
+
+    uint64_t gc_lines;         /* lines reclaimed */
+    uint64_t gc_lines_forced;  /* of those, reclaimed below the high watermark */
+    /* Forced GC that found no victim: out of reclaimable space */
+    uint64_t gc_forced_novictim;
+
+    /* Mapped LPNs. U = live_pages / tt_pgs, the variable GC copy cost hinges on,
+     * and the device-side cross-check for the guest's slow-tier usage. */
+    uint64_t live_pages;
+
+    /* GC copies per LPN, saturating. Joined offline against the guest's shadow
+     * link/unlink trace to tell whether a few cold pages are recopied forever. */
+    uint16_t *gc_copy_cnt;
+
+    /* Held in memory and written out only on CXL_STATS_DUMP: the FTL thread
+     * drives the wall-clock timing model, so file I/O here would distort it. */
+    struct ssd_stats_sample *samples;
+    int nr_samples;
+    uint64_t next_sample_w_host;
 };
 
 /* A TRIM range. The mailbox payload carries an array of this struct. */
@@ -262,6 +306,8 @@ struct ssd {
     struct rte_ring *cxl_resp;
 
     struct buffer dram_buffer;
+
+    struct ssd_stats stats;
 
     bool *dataplane_started_ptr;
     QemuThread ftl_thread;
