@@ -1357,26 +1357,30 @@ static void *ftl_thread(void *arg)
                         lat += ssd_advance_status(ssd, &ppa, creq->ncmd);
                         // backend_memcpy(ssd, ppa, bentry->idx, NAND_TO_BUF);
                     }
-                    else {
-                        struct ppa new_ppa;
-                        // printf("%s,lpn(%" PRId64 ") not mapped to valid ppa\n", ssd->ssdname, lpn);
-                        // printf("Invalid ppa,ch:%d,lun:%d,blk:%d,pl:%d,pg:%d,sec:%d\n",
-                        // ppa.g.ch, ppa.g.lun, ppa.g.blk, ppa.g.pl, ppa.g.pg, ppa.g.sec);
-                        ftl_assert(valid_lpn(ssd, lpn));
-                        new_ppa = get_new_page(ssd);
-                        /* update maptbl */
-                        set_maptbl_ent(ssd, lpn, &new_ppa);
-                        /* update rmap */
-                        set_rmap_ent(ssd, lpn, &new_ppa);
-
-                        mark_page_valid(ssd, &new_ppa);
-                        ssd_advance_write_pointer(ssd);
-                        ssd->stats.w_first_touch++;
-
-                        creq->ncmd->cmd = NAND_WRITE;
-                        lat += ssd_advance_status(ssd, &new_ppa, creq->ncmd);
-                        
-                    }
+                    /* Unmapped LPN (no NAND page backs it yet). The original
+                     * Cylon code (disabled below) programmed a NAND page here at
+                     * once (first_touch). But that page is then held dirty in the
+                     * cache and programmed AGAIN on eviction (writeback): one new
+                     * page written to NAND twice, the first copy left as GC
+                     * garbage.
+                     *
+                     * A real DRAM-cached SSD (CMM-H) programs a new page
+                     * only once, on eviction. So skip it here -- a write stays
+                     * dirty and flush_pg does that single write on eviction (it
+                     * handles the unmapped case); a read returns the zero backing
+                     * with no NAND. */
+                    // else {
+                    //     struct ppa new_ppa;
+                    //     ftl_assert(valid_lpn(ssd, lpn));
+                    //     new_ppa = get_new_page(ssd);
+                    //     set_maptbl_ent(ssd, lpn, &new_ppa);
+                    //     set_rmap_ent(ssd, lpn, &new_ppa);
+                    //     mark_page_valid(ssd, &new_ppa);
+                    //     ssd_advance_write_pointer(ssd);
+                    //     ssd->stats.w_first_touch++;
+                    //     creq->ncmd->cmd = NAND_WRITE;
+                    //     lat += ssd_advance_status(ssd, &new_ppa, creq->ncmd);
+                    // }
                     creq->expire_time += lat;
                     rc = femu_ring_enqueue(ssd->cxl_resp, (void *)&creq, 1);
 
