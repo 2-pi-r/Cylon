@@ -420,7 +420,7 @@ static MemTxResult cxlssd_mem_write(void *opaque, uint64_t addr, uint64_t data, 
  * which points into the mailbox payload - stays valid without a copy.
  */
 static void req_ftl_cmd(FemuCtrl *n, int c,
-                        const struct cylon_trim_ent *ents, int cnt)
+                        const struct cylon_trim_ent *ents, int cnt, int src)
 {
     int rc;
     struct nand_cmd cmd = (struct nand_cmd) {
@@ -434,6 +434,7 @@ static void req_ftl_cmd(FemuCtrl *n, int c,
         .lpn = 0,
         .trim_ents = ents,
         .trim_cnt = cnt,
+        .trim_src = src,
         .expire_time = 0,
     };
 
@@ -475,36 +476,45 @@ static void req_ftl_cmd(FemuCtrl *n, int c,
     }
 }
 
-/* Command code carried in the SET_LSA mailbox command's offset field ("TRM\0") */
-#define CYLON_TRIM_MAGIC 0x54524D00ULL
+/*
+ * Command codes carried in the SET_LSA mailbox command's offset field.
+ * TRIM_DMA is the one the guest module uses; TRIM keeps the range list in the
+ * mailbox payload and stays only for manual `cxl write-labels` debugging.
+ */
+#define CYLON_TRIM_MAGIC     0x54524D00ULL  /* "TRM\0" */
+#define CYLON_TRIM_DMA_MAGIC 0x54524D01ULL  /* "TRM\1" */
 
 /* Same channel: reset the counters at the start of a measurement window, dump
  * them at the end. Payload is unused. ("STR\0" / "STD\0") */
 #define CYLON_STATS_RESET_MAGIC 0x53545200ULL
 #define CYLON_STATS_DUMP_MAGIC  0x53544400ULL
 
+/* One guest page worth of ranges */
+#define CYLON_TRIM_MAX_ENTS (4096 / (int)sizeof(struct cylon_trim_ent))
+
 /*
- * Payload is an array of struct cylon_trim_ent. Returning 0 tells
- * hw/mem/cxl_type3.c's set_lsa() to skip writing the payload to media,
- * since it was consumed as a command instead.
+ * Landing buffer for the DMA'd range list. A single static buffer is safe
+ * because the whole mailbox round trip runs under the BQL, and req_ftl_cmd()
+ * blocks until the FTL thread is done reading it.
  */
-static uint16_t cxlssd_trim(FemuCtrl *n, const void *buf, uint64_t size)
+static struct cylon_trim_ent trim_dma_buf[CYLON_TRIM_MAX_ENTS];
+
+/*
+ * Returning 0 tells hw/mem/cxl_type3.c's set_lsa() to skip writing the payload
+ * to media, since it was consumed as a command instead.
+ */
+static uint16_t cxlssd_trim_submit(FemuCtrl *n,
+                                   const struct cylon_trim_ent *ents,
+                                   int cnt, int src)
 {
-    const struct cylon_trim_ent *ents = buf;
     uint64_t nr_lpns = n->mbe->size >> 12;
-    int cnt, i;
+    int i;
 
     /* Reject on policies that don't support entry removal (CLOCK/S3FIFO) */
     if (!n->ssd->dram_buffer.ops.remove_entry) {
         femu_err("TRIM: replacement policy has no remove_entry, rejected\n");
         return 0;
     }
-
-    if (size == 0 || (size % sizeof(struct cylon_trim_ent)) != 0) {
-        femu_err("TRIM: bad payload size %lu\n", size);
-        return 0;
-    }
-    cnt = size / sizeof(struct cylon_trim_ent);
 
     /* An out-of-range LPN would index past the maptbl array, so reject the
      * whole batch if even one entry is out of bounds */
@@ -518,14 +528,56 @@ static uint16_t cxlssd_trim(FemuCtrl *n, const void *buf, uint64_t size)
         }
     }
 
-    req_ftl_cmd(n, CXL_TRIM, ents, cnt);
+    req_ftl_cmd(n, CXL_TRIM, ents, cnt, src);
     return 0;
+}
+
+/* Legacy path: the range list rides in the mailbox payload itself. */
+static uint16_t cxlssd_trim(FemuCtrl *n, const void *buf, uint64_t size)
+{
+    if (size == 0 || (size % sizeof(struct cylon_trim_ent)) != 0) {
+        femu_err("TRIM: bad payload size %lu\n", size);
+        return 0;
+    }
+
+    return cxlssd_trim_submit(n, buf, size / sizeof(struct cylon_trim_ent),
+                              CYLON_TRIM_SRC_MANUAL);
+}
+
+/* Payload is a struct cylon_trim_db; the ranges themselves come by DMA. */
+static uint16_t cxlssd_trim_dma(FemuCtrl *n, const void *buf, uint64_t size)
+{
+    const struct cylon_trim_db *db = buf;
+    size_t len;
+
+    if (size < sizeof(*db)) {
+        femu_err("TRIM: doorbell too small (%lu)\n", size);
+        return 0;
+    }
+    if (db->count == 0 || db->count > CYLON_TRIM_MAX_ENTS) {
+        femu_err("TRIM: bad range count %u\n", db->count);
+        return 0;
+    }
+    if (db->src > CYLON_TRIM_SRC_MANUAL) {
+        femu_err("TRIM: bad source %u\n", db->src);
+        return 0;
+    }
+
+    len = (size_t)db->count * sizeof(struct cylon_trim_ent);
+    if (pci_dma_read(&n->parent_obj, (hwaddr)db->list_pfn << 12,
+                     trim_dma_buf, len)) {
+        femu_err("TRIM: dma_read failed (pfn=0x%x cnt=%u)\n",
+                 db->list_pfn, db->count);
+        return 0;
+    }
+
+    return cxlssd_trim_submit(n, trim_dma_buf, db->count, db->src);
 }
 
 #ifdef LSA_TROLL
 static void req_ftl(FemuCtrl *n, int c)
 {
-    req_ftl_cmd(n, c, NULL, 0);
+    req_ftl_cmd(n, c, NULL, 0, 0);
 }
 #endif
 
@@ -669,13 +721,16 @@ static uint16_t set_lsa(struct FemuCtrl *n, const void *buf, uint64_t size, uint
     if (offset == CYLON_TRIM_MAGIC)
         return cxlssd_trim(n, buf, size);
 
+    if (offset == CYLON_TRIM_DMA_MAGIC)
+        return cxlssd_trim_dma(n, buf, size);
+
     if (offset == CYLON_STATS_RESET_MAGIC) {
-        req_ftl_cmd(n, CXL_STATS_RESET, NULL, 0);
+        req_ftl_cmd(n, CXL_STATS_RESET, NULL, 0, 0);
         return 0;
     }
 
     if (offset == CYLON_STATS_DUMP_MAGIC) {
-        req_ftl_cmd(n, CXL_STATS_DUMP, NULL, 0);
+        req_ftl_cmd(n, CXL_STATS_DUMP, NULL, 0, 0);
         return 0;
     }
 

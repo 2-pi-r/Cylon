@@ -253,6 +253,11 @@ struct ssd_stats {
      * and the device-side cross-check for the guest's slow-tier usage. */
     uint64_t live_pages;
 
+    /* Indexed by CYLON_TRIM_SRC_*. Split by source so a disagreement with the
+     * guest's trim_pages_* in /proc/vmstat points at one path. */
+    uint64_t trim_pages[3];
+    uint64_t trim_cmds[3];
+
     /* GC copies per LPN, saturating. Joined offline against the guest's shadow
      * link/unlink trace to tell whether a few cold pages are recopied forever. */
     uint16_t *gc_copy_cnt;
@@ -264,10 +269,28 @@ struct ssd_stats {
     uint64_t next_sample_w_host;
 };
 
-/* A TRIM range. The mailbox payload carries an array of this struct. */
+/* A TRIM range. The guest builds an array of these in its own RAM. */
 struct cylon_trim_ent {
     uint32_t start_lpn;
     uint32_t nr_pages;
+};
+
+/* Which guest path produced a TRIM batch. Log/accounting only. */
+enum {
+    CYLON_TRIM_SRC_REPORT = 0,  /* Linux free page reporting */
+    CYLON_TRIM_SRC_HOOK   = 1,  /* SSP page-death hook */
+    CYLON_TRIM_SRC_MANUAL = 2,  /* cxl write-labels, for debugging */
+};
+
+/*
+ * Doorbell payload. Only this crosses the mailbox; the device DMAs the range
+ * list out of guest RAM, so the cost no longer scales with the range count.
+ * Writing the mailbox payload costs one VM exit per 4 bytes.
+ */
+struct cylon_trim_db {
+    uint32_t list_pfn;   /* guest physical page holding the cylon_trim_ent array */
+    uint16_t count;      /* ranges in that page */
+    uint16_t src;        /* CYLON_TRIM_SRC_* */
 };
 
 struct cxl_req {
@@ -276,9 +299,10 @@ struct cxl_req {
     lpn_t lpn;
 
     /* CXL_TRIM only. The issuing thread blocks until completion, so we point
-     * at the mailbox payload instead of copying it. */
+     * at the caller's buffer instead of copying it. */
     const struct cylon_trim_ent *trim_ents;
     int trim_cnt;
+    int trim_src;
 
     /* response */
     uint64_t expire_time;

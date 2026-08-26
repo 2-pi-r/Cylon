@@ -416,6 +416,8 @@ static void ssd_stats_reset(struct ssd *ssd)
 
     st->w_first_touch = st->w_writeback = st->w_gc = 0;
     st->gc_lines = st->gc_lines_forced = st->gc_forced_novictim = 0;
+    memset(st->trim_pages, 0, sizeof(st->trim_pages));
+    memset(st->trim_cmds, 0, sizeof(st->trim_cmds));
     st->nr_samples = 0;
     st->next_sample_w_host = 0;
     memset(st->gc_copy_cnt, 0, sizeof(uint16_t) * ssd->sp.tt_pgs);
@@ -448,6 +450,15 @@ static void ssd_stats_dump(struct ssd *ssd)
             st->gc_lines, st->gc_lines_forced, st->gc_forced_novictim,
             st->live_pages, ssd->sp.tt_pgs,
             (double)st->live_pages / ssd->sp.tt_pgs);
+
+    ftl_log("stats trim_pages report=%lu hook=%lu manual=%lu "
+            "trim_cmds report=%lu hook=%lu manual=%lu\n",
+            st->trim_pages[CYLON_TRIM_SRC_REPORT],
+            st->trim_pages[CYLON_TRIM_SRC_HOOK],
+            st->trim_pages[CYLON_TRIM_SRC_MANUAL],
+            st->trim_cmds[CYLON_TRIM_SRC_REPORT],
+            st->trim_cmds[CYLON_TRIM_SRC_HOOK],
+            st->trim_cmds[CYLON_TRIM_SRC_MANUAL]);
 
     if (st->nr_samples >= SSD_STATS_SAMPLE_MAX)
         ftl_err("stats dump: sample buffer full, time series truncated at %d\n",
@@ -1276,12 +1287,16 @@ static void *ftl_thread(void *arg)
 
                 /* Must work regardless of LSA_TROLL, so this lives outside the switch below */
                 if (creq->ncmd->cmd == CXL_TRIM) {
+                    int src = creq->trim_src;
+
                     for (int ti = 0; ti < creq->trim_cnt; ti++) {
                         const struct cylon_trim_ent *e = &creq->trim_ents[ti];
 
                         for (uint32_t k = 0; k < e->nr_pages; k++)
                             ftl_trim(ssd, e->start_lpn + k);
+                        ssd->stats.trim_pages[src] += e->nr_pages;
                     }
+                    ssd->stats.trim_cmds[src]++;
 
                     rc = femu_ring_enqueue(ssd->cxl_resp, (void *)&creq, 1);
                     if (rc != 1) {
