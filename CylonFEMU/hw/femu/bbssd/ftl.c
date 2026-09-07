@@ -390,37 +390,66 @@ static void ssd_init_stats(struct ssd *ssd)
 static void ssd_stats_sample(struct ssd *ssd)
 {
     struct ssd_stats *st = &ssd->stats;
-    uint64_t w_host = st->w_first_touch + st->w_writeback;
+    struct buffer *b = &ssd->dram_buffer;
+    uint64_t w_writeback = st->w_writeback[WRITEBACK_SRC_BACKGROUND] +
+                           st->w_writeback[WRITEBACK_SRC_DEMAND];
+    uint64_t reqs = b->read_hit + b->read_miss + b->write_hit + b->write_miss;
 
-    if (w_host < st->next_sample_w_host)
+    /* Either counter making a period's worth of progress earns a sample, so a
+     * phase that only reads is covered as densely as one that only writes. */
+    if (w_writeback < st->next_sample_w_writeback && reqs < st->next_sample_reqs)
         return;
-    st->next_sample_w_host = w_host + SSD_STATS_SAMPLE_PERIOD;
+    st->next_sample_w_writeback = w_writeback + SSD_STATS_SAMPLE_PERIOD;
+    st->next_sample_reqs = reqs + SSD_STATS_SAMPLE_REQ_PERIOD;
 
     if (st->nr_samples >= SSD_STATS_SAMPLE_MAX)
         return;
 
     st->samples[st->nr_samples++] = (struct ssd_stats_sample) {
-        .time_ns         = qemu_clock_get_ns(QEMU_CLOCK_REALTIME),
-        .w_host          = w_host,
-        .w_gc            = st->w_gc,
-        .gc_lines        = st->gc_lines,
-        .gc_lines_forced = st->gc_lines_forced,
-        .live_pages      = st->live_pages,
-        .free_lines      = ssd->lm.free_line_cnt,
+        .time_ns              = qemu_clock_get_ns(QEMU_CLOCK_REALTIME),
+        .w_writeback          = w_writeback,
+        .w_gc                 = st->w_gc,
+        .gc_lines             = st->gc_lines,
+        .gc_lines_forced      = st->gc_lines_forced,
+        .live_pages           = st->live_pages,
+        .free_lines           = ssd->lm.free_line_cnt,
+        .r_hit                = b->read_hit,
+        .r_miss               = b->read_miss,
+        .w_hit                = b->write_hit,
+        .w_miss               = b->write_miss,
+        .stall_ns             = st->stall_ns,
+        .w_writeback_demand   = st->w_writeback[WRITEBACK_SRC_DEMAND],
+        .r_cache_fill         = st->r_cache_fill,
+        .r_gc                 = st->r_gc,
+        .stall_cache_fill_ns  = st->stall_cache_fill_ns,
+        .stall_writeback_ns   = st->stall_writeback_ns,
+        .evict_inflight_waits = st->evict_inflight_waits,
+        .dirty_cnt            = b->dirty_cnt,
     };
 }
 
 static void ssd_stats_reset(struct ssd *ssd)
 {
     struct ssd_stats *st = &ssd->stats;
+    struct buffer *b = &ssd->dram_buffer;
 
-    st->w_first_touch = st->w_writeback = st->w_gc = 0;
+    st->w_first_touch = st->w_gc = 0;
+    memset(st->w_writeback, 0, sizeof(st->w_writeback));
     st->gc_lines = st->gc_lines_forced = st->gc_forced_novictim = 0;
+    st->r_cache_fill = st->r_gc = 0;
+    st->stall_ns = st->stall_cache_fill_ns = st->stall_writeback_ns = 0;
+    st->evict_inflight_waits = 0;
     memset(st->trim_pages, 0, sizeof(st->trim_pages));
     memset(st->trim_cmds, 0, sizeof(st->trim_cmds));
     st->nr_samples = 0;
-    st->next_sample_w_host = 0;
+    st->next_sample_w_writeback = 0;
+    st->next_sample_reqs = 0;
     memset(st->gc_copy_cnt, 0, sizeof(uint16_t) * ssd->sp.tt_pgs);
+
+    /* The buffer owns its hit/miss counters; zero them here so every counter
+     * covers the same window. Cache contents are left alone -- this resets the
+     * measurement, not the device. */
+    b->read_hit = b->read_miss = b->write_hit = b->write_miss = 0;
 
     /* live_pages is current device state, not an event count, so it survives */
 }
@@ -434,7 +463,12 @@ static void ssd_stats_reset(struct ssd *ssd)
 static void ssd_stats_dump(struct ssd *ssd)
 {
     struct ssd_stats *st = &ssd->stats;
-    uint64_t w_host = st->w_first_touch + st->w_writeback;
+    struct buffer *b = &ssd->dram_buffer;
+    uint64_t w_writeback = st->w_writeback[WRITEBACK_SRC_BACKGROUND] +
+                           st->w_writeback[WRITEBACK_SRC_DEMAND];
+    uint64_t w_host = st->w_first_touch + w_writeback;
+    uint64_t reads = b->read_hit + b->read_miss;
+    uint64_t writes = b->write_hit + b->write_miss;
     const char *base = getenv("CYLON_STATS_PATH");
     char path[256];
     FILE *f;
@@ -445,11 +479,45 @@ static void ssd_stats_dump(struct ssd *ssd)
     ftl_log("stats w_first_touch=%lu w_writeback=%lu w_gc=%lu nand_write=%lu "
             "waf=%.4f gc_lines=%lu gc_lines_forced=%lu gc_forced_novictim=%lu "
             "live_pages=%lu tt_pgs=%d u=%.4f\n",
-            st->w_first_touch, st->w_writeback, st->w_gc, w_host + st->w_gc,
+            st->w_first_touch, w_writeback, st->w_gc, w_host + st->w_gc,
             w_host ? (double)(w_host + st->w_gc) / w_host : 0.0,
             st->gc_lines, st->gc_lines_forced, st->gc_forced_novictim,
             st->live_pages, ssd->sp.tt_pgs,
             (double)st->live_pages / ssd->sp.tt_pgs);
+
+    /* A demand writeback is one a request had to wait through, so its share of
+     * the total says how much of the write cost the guest actually saw. */
+    ftl_log("stats w_writeback_bg=%lu w_writeback_demand=%lu "
+            "evict_inflight_waits=%lu dirty=%lu/%lu (hi=%lu lo=%lu)\n",
+            st->w_writeback[WRITEBACK_SRC_BACKGROUND],
+            st->w_writeback[WRITEBACK_SRC_DEMAND],
+            st->evict_inflight_waits,
+            b->dirty_cnt, b->size, b->dirty_hi, b->dirty_lo);
+
+    ftl_log("stats r_hit=%lu r_miss=%lu w_hit=%lu w_miss=%lu "
+            "r_hitrate=%.4f w_hitrate=%.4f entries=%lu/%lu way=%lu\n",
+            b->read_hit, b->read_miss, b->write_hit, b->write_miss,
+            reads ? (double)b->read_hit / reads : 0.0,
+            writes ? (double)b->write_hit / writes : 0.0,
+            b->entry_cnt, b->size,
+            /* Mirrors buffer_init_set(): WAY_FULL means one set holding
+             * everything, not 1 << WAY_FULL ways. */
+            (b->way == WAY_FULL) ? b->size : (uint64_t)(1 << b->way));
+
+    /* stall_s is directly comparable to the benchmark's reported kernel time:
+     * whatever it does not cover came from VM exits, the FTL round trip, host
+     * NUMA, or the guest itself, not from the emulated NAND. */
+    ftl_log("stats r_cache_fill=%lu r_gc=%lu stall_ns=%lu stall_s=%.3f "
+            "mean_stall_ns=%.1f\n",
+            st->r_cache_fill, st->r_gc, st->stall_ns, st->stall_ns / 1e9,
+            (reads + writes) ? (double)st->stall_ns / (reads + writes) : 0.0);
+
+    /* writeback_share is what this whole change exists to measure: before the
+     * demand-wait path existed it was 0 by construction. */
+    ftl_log("stats stall_cache_fill_ns=%lu stall_writeback_ns=%lu "
+            "writeback_share=%.4f\n",
+            st->stall_cache_fill_ns, st->stall_writeback_ns,
+            st->stall_ns ? (double)st->stall_writeback_ns / st->stall_ns : 0.0);
 
     ftl_log("stats trim_pages report=%lu hook=%lu manual=%lu "
             "trim_cmds report=%lu hook=%lu manual=%lu\n",
@@ -470,14 +538,23 @@ static void ssd_stats_dump(struct ssd *ssd)
         ftl_err("stats dump: cannot open %s\n", path);
         return;
     }
-    fprintf(f, "time_ns,w_host,w_gc,gc_lines,gc_lines_forced,live_pages,"
-               "free_lines\n");
+    /* New columns are appended, so column positions the analysis scripts
+     * already use do not move. */
+    fprintf(f, "time_ns,w_writeback,w_gc,gc_lines,gc_lines_forced,live_pages,"
+               "free_lines,r_hit,r_miss,w_hit,w_miss,stall_ns,"
+               "w_writeback_demand,r_cache_fill,r_gc,stall_cache_fill_ns,"
+               "stall_writeback_ns,evict_inflight_waits,dirty_cnt\n");
     for (int i = 0; i < st->nr_samples; i++) {
         struct ssd_stats_sample *s = &st->samples[i];
 
-        fprintf(f, "%lu,%lu,%lu,%lu,%lu,%lu,%lu\n", s->time_ns, s->w_host,
-                s->w_gc, s->gc_lines, s->gc_lines_forced, s->live_pages,
-                s->free_lines);
+        fprintf(f, "%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,"
+                   "%lu,%lu,%lu,%lu,%lu,%lu,%lu\n",
+                s->time_ns, s->w_writeback, s->w_gc, s->gc_lines,
+                s->gc_lines_forced, s->live_pages, s->free_lines,
+                s->r_hit, s->r_miss, s->w_hit, s->w_miss, s->stall_ns,
+                s->w_writeback_demand, s->r_cache_fill, s->r_gc,
+                s->stall_cache_fill_ns, s->stall_writeback_ns,
+                s->evict_inflight_waits, s->dirty_cnt);
     }
     fclose(f);
 
@@ -509,7 +586,18 @@ static void buffer_init(struct ssd *ssd)
 	buffer->thres_pcent = 0.9999;
     buffer->force_pcent = 0.99999;
 	buffer->entry_cnt = 0;
-	
+
+    /* Background writeback watermarks, converted from percent to entries once.
+     * The band width (hi - lo) is also how much a single pass writes back, so
+     * a narrow band means frequent small passes. Guard against a low >= high
+     * that would make the hysteresis meaningless. */
+    buffer->dirty_cnt = 0;
+    buffer->wb_cursor = 0;
+    buffer->dirty_hi = buffer->size * ssd->wb_thres_pcent / 100;
+    buffer->dirty_lo = buffer->size * ssd->wb_thres_pcent_low / 100;
+    if (buffer->dirty_lo >= buffer->dirty_hi)
+        buffer->dirty_lo = buffer->dirty_hi / 2;
+
     buffer->policy = spp->policy;
     buffer->degree = spp->degree;
     buffer->stride = 1;
@@ -581,6 +669,8 @@ void ssd_init(FemuCtrl *n)
     struct ssdparams *spp = &ssd->sp;
     ssd->b = n->mbe;
     ssd->buffer_way = n->buffer_way;
+    ssd->wb_thres_pcent = n->wb_thres_pcent;
+    ssd->wb_thres_pcent_low = n->wb_thres_pcent_low;
 
     ftl_assert(ssd);
 
@@ -845,6 +935,7 @@ static void gc_read_page(struct ssd *ssd, struct ppa *ppa)
         gcr.cmd = NAND_READ;
         gcr.stime = 0;
         ssd_advance_status(ssd, ppa, &gcr);
+        ssd->stats.r_gc++;
     }
 }
 
@@ -1071,7 +1162,7 @@ static uint64_t ssd_write(struct ssd *ssd, NvmeRequest *req)
         if (bentry) {//buffer hit must not be happened
             // printf("[W_Buffer]: lpn(%" PRId64 ") cache hit!! %s. THIS MUST NOT BE HAPPENED!!\n", lpn, ssd->ssdname);
             
-            bentry->dirty = true;
+            buffer_mark_dirty(buffer, bentry, true);
             buffer_insert_entry(buffer, bentry, INSERT_NO_PREFETCH);
         }
         else {//buffer miss
@@ -1268,17 +1359,18 @@ static void *ftl_thread(void *arg)
     // FILE *f = fopen("/home/necsst/cxlssd_io.log", "a");
     while (1) {
         if (n->femu_mode == FEMU_CXLSSD_MODE) {
-            // if (buffer_force_eviction(buffer))
-            // {
-            //     evict_victim(ssd);
-            // }
+            /* Clean ahead of demand so most evictions find a reusable line.
+             * How lazy this is set to is what decides how often a request ends
+             * up waiting on a writeback, which is the effect being measured. */
+            buffer_writeback_bg(buffer);
 
             if (ssd->cxl_req && femu_ring_count(ssd->cxl_req)) {
                 struct cxl_req *creq = NULL;
                 struct ppa ppa;
                 struct buffer_entry *bentry;
                 lpn_t lpn;
-                
+                uint64_t writeback_wait = 0;
+
                 rc = femu_ring_dequeue(ssd->cxl_req, (void *)&creq, 1);
                 if (rc != 1) {
                     printf("FEMU: FTL cxl_req dequeue failed\n");
@@ -1353,23 +1445,35 @@ static void *ftl_thread(void *arg)
                 bentry = buffer_lookup_entry(buffer, lpn);
                 if (bentry) {//buffer hit
                     rc = femu_ring_enqueue(ssd->cxl_resp, (void *)&creq, 1);
-                    bentry->dirty = (bentry->dirty==false && read)?false:true;
+                    buffer_mark_dirty(buffer, bentry,
+                                      (bentry->dirty==false && read)?false:true);
 
                     if (read)   buffer->read_hit++;
                     else        buffer->write_hit++;
+                    /* An entry already in the cache is never evicted by its own
+                     * reinsertion, so this cannot wait. */
                     buffer_insert_entry(buffer, bentry, INSERT_NO_PREFETCH);
                 }
                 else {//buffer miss: fetch from NAND
                     bentry = buffer_entry_init(buffer, lpn);
-                    bentry->dirty = (read)?false:true;
+                    buffer_mark_dirty(buffer, bentry, read?false:true);
 
                     if (read)   buffer->read_miss++;
                     else        buffer->write_miss++;
-                    
+
+                    /* Take the line first. If its victim is still dirty, or a
+                     * background writeback of it is still in flight, the line is
+                     * not reusable yet and the requester waits it out. This has
+                     * to happen before the response is enqueued below, otherwise
+                     * there is nothing left to charge the wait to. */
+                    writeback_wait = buffer_insert_entry(buffer, bentry,
+                                                         INSERT_PREFETCH);
+
                     ppa = get_maptbl_ent(ssd, lpn);
                     if (mapped_ppa(&ppa) && valid_ppa(ssd, &ppa)) {
                         creq->ncmd->cmd = NAND_READ;
                         lat += ssd_advance_status(ssd, &ppa, creq->ncmd);
+                        ssd->stats.r_cache_fill++;
                         // backend_memcpy(ssd, ppa, bentry->idx, NAND_TO_BUF);
                     }
                     /* Unmapped LPN (no NAND page backs it yet). The original
@@ -1396,10 +1500,15 @@ static void *ftl_thread(void *arg)
                     //     creq->ncmd->cmd = NAND_WRITE;
                     //     lat += ssd_advance_status(ssd, &new_ppa, creq->ncmd);
                     // }
-                    creq->expire_time += lat;
+                    /* Hits never touch expire_time, so accumulating only here
+                     * keeps the fast path clear and still totals every ns the
+                     * guest was made to wait. cxlssd.c spins until expire_time,
+                     * so whatever is added here is real guest stall. */
+                    creq->expire_time += lat + writeback_wait;
+                    ssd->stats.stall_cache_fill_ns += lat;
+                    ssd->stats.stall_writeback_ns += writeback_wait;
+                    ssd->stats.stall_ns += lat + writeback_wait;
                     rc = femu_ring_enqueue(ssd->cxl_resp, (void *)&creq, 1);
-
-                    buffer_insert_entry(buffer, bentry, INSERT_PREFETCH);
                 }
                 /* clean one line if needed (in the background) */
                 if (should_gc(ssd)) {
@@ -1465,20 +1574,24 @@ static void *ftl_thread(void *arg)
 
 
  /*
- * Writeback for dirty eviction (async model).
- * Overwriting here is the only way a PPA gets invalidated in Cylon, 
+ * Program one dirty page to NAND.
+ * Overwriting here is the only way a PPA gets invalidated in Cylon,
  * so this is the only source of GC victim lines (raises line->ipc).
  *
- * Latency isn't charged to the requester. ssd_advance_status just
- * occupies the LUN; later requests simply queue behind it.
+ * Returns how long from now until the program completes, which includes any
+ * queueing already on the target LUN because swr.stime = 0 makes
+ * ssd_advance_status() measure from the current clock. src only selects a
+ * counter; the work done is identical either way, and it is the caller that
+ * decides whether to charge that time to a request (demand eviction) or to
+ * record it as a completion time (background writeback).
  */
-uint64_t flush_pg(struct ssd* ssd, lpn_t lpn)
+uint64_t flush_pg(struct ssd* ssd, lpn_t lpn, int src)
 {
     struct ppa ppa;
     uint64_t curlat = 0, maxlat = 0;
     struct nand_lun *new_lun;
 
-    ssd->stats.w_writeback++;
+    ssd->stats.w_writeback[src]++;
 
     ppa = get_maptbl_ent(ssd, lpn);
     if (mapped_ppa(&ppa)) {
@@ -1510,5 +1623,5 @@ uint64_t flush_pg(struct ssd* ssd, lpn_t lpn)
     new_lun = get_lun(ssd, &ppa);
     new_lun->evict_endtime = new_lun->next_lun_avail_time;
 
-    return 0;
+    return maxlat;
 }

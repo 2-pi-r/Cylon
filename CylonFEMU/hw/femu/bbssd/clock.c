@@ -9,7 +9,7 @@ static inline struct buffer_entry *clock_next(struct set *set, struct buffer_ent
     return n ? n : QTAILQ_FIRST(&set->queue);
 }
 
-int clock_evict_victim(struct buffer *b, struct set *set) {
+int clock_evict_victim(struct buffer *b, struct set *set, uint64_t *wait) {
     if (QTAILQ_EMPTY(&set->queue))
         return -1;
 
@@ -29,9 +29,8 @@ int clock_evict_victim(struct buffer *b, struct set *set) {
             /* choose ent as victim; advance hand to next BEFORE removal */
             struct buffer_entry *next = clock_next(set, ent);
 
-            /* Flush page to NAND (mirror of your FIFO path) */
-            if (ent->dirty)
-                flush_pg(b->ssd, ent->lpn);
+            /* Program it, or wait out a background writeback still in flight */
+            *wait += buffer_evict_cost(b, ent);
 
             /* remove from auxiliary indices */
             g_tree_remove(b->tree, ent);     // remove from avl tree
@@ -60,7 +59,7 @@ int clock_evict_victim(struct buffer *b, struct set *set) {
     }
 }
 
-int clock_insert_entry(struct buffer *b, struct buffer_entry *eptr) {
+int clock_insert_entry(struct buffer *b, struct buffer_entry *eptr, uint64_t *wait) {
     struct set *set = buffer_get_set(b, eptr->lpn);
 
     if (!g_tree_lookup(b->tree, eptr)) {
@@ -70,7 +69,7 @@ int clock_insert_entry(struct buffer *b, struct buffer_entry *eptr) {
             ent_max = b->size;
 
         while (!(set->cnt < ent_max)) {
-            if (clock_evict_victim(b, set) < 0)
+            if (clock_evict_victim(b, set, wait) < 0)
                 return -1;
         }
 

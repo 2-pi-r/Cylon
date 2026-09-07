@@ -1238,7 +1238,12 @@ typedef struct FemuCtrl {
         WAY_FULL
     };        
     */
-    uint8_t         buffer_way; 
+    uint8_t         buffer_way;
+    /* Background writeback watermarks, percent of DRAM cache lines that may be
+     * dirty. Cleaning starts above wb_thres_pcent and stops below
+     * wb_thres_pcent_low; the gap also bounds how much one pass writes back. */
+    uint8_t         wb_thres_pcent;
+    uint8_t         wb_thres_pcent_low; 
     uint8_t         cxl_skip_ftl;
     uint64_t        base_gpa;
     

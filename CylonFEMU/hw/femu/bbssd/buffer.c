@@ -55,6 +55,7 @@ struct buffer_entry *buffer_entry_init(struct buffer *b, lpn_t lpn)
         
     new->lpn = lpn;
     new->dirty = false;
+    new->writeback_endtime = 0;
 
 	return new;
 }
@@ -151,10 +152,14 @@ struct set* buffer_get_set(struct buffer *b, lpn_t lpn)
 // 	return (b->size !=0) && (b->entry_cnt > (b->size * b->force_pcent));
 // }
 
-bool buffer_insert_entry(struct buffer *b, struct buffer_entry *bentry, int prefetch)
+/*
+ * Returns how long the requester must wait for the line this insert took. Only
+ * the demand insert's wait is returned; see the note on the prefetch loop.
+ */
+uint64_t buffer_insert_entry(struct buffer *b, struct buffer_entry *bentry, int prefetch)
 {
 	assert(bentry != NULL);
-	bool res;
+	uint64_t wait = 0;
 	lpn_t lpn;
 	uint64_t start_lpn = bentry->lpn + b->stride;
 	uint64_t end_lpn = start_lpn + b->degree;
@@ -162,15 +167,18 @@ bool buffer_insert_entry(struct buffer *b, struct buffer_entry *bentry, int pref
 
 	if (b->size == 0) {
 		// free(b);
-		return false;
+		return 0;
 	}
 
 	// return false;
 	// printf("[FEMU CXL] Insert entry: lpn: %lx\n", bentry->lpn);
-	res = b->ops.insert_entry(b, bentry);
-	
+	b->ops.insert_entry(b, bentry, &wait);
+
 	/* prefetch */
+	/* TODO: prefetch not considered. */
 	if (prefetch == INSERT_PREFETCH) {
+		uint64_t prefetch_wait = 0;	/* discarded, see TODO above */
+
 		// printf("[FEMU CXL] Prefetch start: lpn: %lx, prefetch: %lx - %lx\n",(*bentry)->lpn, start_lpn, end_lpn-1);
 		for(lpn = start_lpn; lpn < end_lpn; lpn++){
 			if (!valid_user_lpn(b->ssd, lpn))
@@ -180,14 +188,106 @@ bool buffer_insert_entry(struct buffer *b, struct buffer_entry *bentry, int pref
 			if (!pbentry) {
 				pbentry = buffer_entry_init(b, lpn);
 			}
-			b->ops.insert_entry(b, pbentry);
+			b->ops.insert_entry(b, pbentry, &prefetch_wait);
 		}
+		(void)prefetch_wait;
 		// printf(">>> Done\n");
 	}
-	
-	return res;
+
+	return wait;
 }
 
+
+/*
+ * dirty_cnt has to follow every change to entry->dirty, so route them all
+ * through here rather than assigning the flag directly.
+ */
+void buffer_mark_dirty(struct buffer *b, struct buffer_entry *ent, bool dirty)
+{
+	if (ent->dirty == dirty)
+		return;
+
+	ent->dirty = dirty;
+	if (dirty)
+		b->dirty_cnt++;
+	else if (b->dirty_cnt)
+		b->dirty_cnt--;
+}
+
+/* Cost of taking this entry's line, before it is unlinked:
+ *   dirty     - not in NAND yet, so program it now and wait it out
+ *   in-flight - a background program is still landing, wait out its remainder
+ *   clean     - free
+ */
+uint64_t buffer_evict_cost(struct buffer *b, struct buffer_entry *victim)
+{
+	uint64_t now;
+
+	if (victim->dirty) {
+		buffer_mark_dirty(b, victim, false);
+		return flush_pg(b->ssd, victim->lpn, WRITEBACK_SRC_DEMAND);
+	}
+
+	now = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+	if (victim->writeback_endtime > now) {
+		b->ssd->stats.evict_inflight_waits++;
+		return victim->writeback_endtime - now;
+	}
+
+	return 0;
+}
+
+/* Write one dirty entry out but leave it cached, so the line turns clean in
+ * place instead of being evicted. It is not reusable until the program lands,
+ * which writeback_endtime records for buffer_evict_cost(). */
+static void writeback_entry(struct buffer *b, struct buffer_entry *ent)
+{
+	uint64_t lat = flush_pg(b->ssd, ent->lpn, WRITEBACK_SRC_BACKGROUND);
+
+	buffer_mark_dirty(b, ent, false);
+	ent->writeback_endtime = qemu_clock_get_ns(QEMU_CLOCK_REALTIME) + lat;
+}
+
+/* Scan in the order the eviction policy consumes the set, oldest first, so what
+ * is cleaned is what is about to be evicted and any still-in-flight line a
+ * demand eviction meets has the least time left. */
+static void writeback_set(struct buffer *b, struct set *set)
+{
+	struct buffer_entry *ent;
+
+	if (b->way == WAY_1) {
+		ent = set->entry;
+		if (ent && ent->dirty)
+			writeback_entry(b, ent);
+		return;
+	}
+
+	QTAILQ_FOREACH(ent, &set->queue, b_entry) {
+		if (b->dirty_cnt <= b->dirty_lo)
+			return;
+		if (ent->dirty)
+			writeback_entry(b, ent);
+	}
+}
+
+/* Start above dirty_hi, run until below dirty_lo, so the band width also caps
+ * one pass. Deliberately unthrottled beyond that: a writeback backlog delaying
+ * later NAND work is exactly the write cost this is meant to expose. */
+void buffer_writeback_bg(struct buffer *b)
+{
+	uint64_t n_set, scanned;
+
+	if (b->size == 0 || b->dirty_cnt <= b->dirty_hi)
+		return;
+
+	n_set = b->set_mask ? b->set_mask : 1;
+	for (scanned = 0; scanned < n_set; scanned++) {
+		if (b->dirty_cnt <= b->dirty_lo)
+			break;
+		writeback_set(b, &b->sets[b->wb_cursor]);
+		b->wb_cursor = (b->wb_cursor + 1) % n_set;
+	}
+}
 
 /*
  * Remove the entry for this LPN from the cache, if present (TRIM only).
@@ -232,7 +332,8 @@ void buffer_clear(struct buffer *buffer)
 			if (buffer->sets[i].entry) {
 				g_tree_remove(buffer->tree, buffer->sets[i].entry);
 				if (buffer->sets[i].entry->dirty)
-					flush_pg(buffer->ssd, buffer->sets[i].entry->lpn);
+					flush_pg(buffer->ssd, buffer->sets[i].entry->lpn,
+						 WRITEBACK_SRC_DEMAND);
 				direct_mr_del(buffer, buffer->sets[i].entry->lpn);
 				free(buffer->sets[i].entry);
 			}
@@ -249,7 +350,7 @@ void buffer_clear(struct buffer *buffer)
 				QTAILQ_REMOVE(&set->queue, ent, b_entry);
 				
 				if (ent->dirty)
-					flush_pg(buffer->ssd, ent->lpn);
+					flush_pg(buffer->ssd, ent->lpn, WRITEBACK_SRC_DEMAND);
 				g_tree_remove(buffer->tree, ent);	//remove from avl tree
 				direct_mr_del(buffer, ent->lpn);
 
@@ -265,6 +366,10 @@ void buffer_clear(struct buffer *buffer)
 	
 	buffer->tree = g_tree_new(comp_buffer);
 	// b->bitmap = bitmap_new(b->size);
+
+	/* Every entry is gone, so nothing is dirty and the scan restarts. */
+	buffer->dirty_cnt = 0;
+	buffer->wb_cursor = 0;
 
     buffer->read_hit = buffer->read_miss = 0; 
     buffer->write_hit = buffer->write_miss = 0;

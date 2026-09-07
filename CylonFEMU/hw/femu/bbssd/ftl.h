@@ -222,18 +222,43 @@ enum {
     CXL_STATS_DUMP,
 };
 
-/* Sampling period in host writes, and the cap on samples held in memory */
-#define SSD_STATS_SAMPLE_PERIOD (1 << 12)
-#define SSD_STATS_SAMPLE_MAX    (1 << 18)
+/* Sampling periods, and the cap on samples held in memory. A read-dominated
+ * kernel (PageRank) programs almost nothing while it runs, so sampling on host
+ * writes alone leaves that phase nearly uncovered -- the series ends up dense
+ * over the load and sparse over the part being measured. The request period
+ * keeps it dense there too, and is larger because a miss storm produces
+ * requests far faster than page programs. */
+#define SSD_STATS_SAMPLE_PERIOD     (1 << 12)
+#define SSD_STATS_SAMPLE_REQ_PERIOD (1 << 14)
+#define SSD_STATS_SAMPLE_MAX        (1 << 18)
 
 struct ssd_stats_sample {
     uint64_t time_ns;
-    uint64_t w_host;
+    /* w_host (w_first_touch + w_writeback) used to sit in this slot. It read as
+     * "requests the host sent", which it is not, so it is gone. w_first_touch is
+     * 0 on the CXL path, so the writeback total below carries the same numbers
+     * and existing column positions still line up. */
+    uint64_t w_writeback;   /* both sources summed */
     uint64_t w_gc;
     uint64_t gc_lines;
     uint64_t gc_lines_forced;
     uint64_t live_pages;
     uint64_t free_lines;
+    /* Buffer hit/miss, split by direction. Read misses are what a read-heavy
+     * workload actually waits on, so they carry the run time. */
+    uint64_t r_hit;
+    uint64_t r_miss;
+    uint64_t w_hit;
+    uint64_t w_miss;
+    uint64_t stall_ns;
+    /* Appended, so column positions above do not move. */
+    uint64_t w_writeback_demand;  /* of w_writeback, the part a miss waited on */
+    uint64_t r_cache_fill;
+    uint64_t r_gc;
+    uint64_t stall_cache_fill_ns;
+    uint64_t stall_writeback_ns;
+    uint64_t evict_inflight_waits;
+    uint64_t dirty_cnt;           /* shows the watermark band being worked */
 };
 
 struct ssd_stats {
@@ -241,13 +266,40 @@ struct ssd_stats {
      * first access to an unmapped LPN, so even a read programs a page; it should
      * stay flat after warm-up, otherwise the measured window isn't warmed up. */
     uint64_t w_first_touch;
-    uint64_t w_writeback;      /* dirty buffer eviction */
+    /* Indexed by WRITEBACK_SRC_*: background (watermark-driven, entry stays
+     * cached) vs demand (a miss needed the line and waited for the program). */
+    uint64_t w_writeback[WRITEBACK_SRC_NR];
     uint64_t w_gc;             /* GC valid-page copies */
 
     uint64_t gc_lines;         /* lines reclaimed */
     uint64_t gc_lines_forced;  /* of those, reclaimed below the high watermark */
     /* Forced GC that found no victim: out of reclaimable space */
     uint64_t gc_forced_novictim;
+
+    /* NAND page reads that filled the cache after a miss on a mapped LPN. Named
+     * for the cause, like the w_* counters, so distinct from r_gc. Smaller than
+     * read_miss + write_miss: a miss on an unmapped LPN reads nothing. Holds for
+     * write misses too -- those fill the line as well. */
+    uint64_t r_cache_fill;
+    /* NAND page reads GC does before copying a valid page. Always equal to w_gc,
+     * so derivable, but device load is r_cache_fill + r_gc + w_writeback + w_gc
+     * and this half is easy to forget. */
+    uint64_t r_gc;
+
+    /* Emulated device latency actually charged to the guest, summed over CXL
+     * requests. Hits and unmapped misses add zero, so this is the part of the
+     * run the timing model accounts for; compare it against the benchmark's
+     * wall clock to see how much of the run came from anything else.
+     * stall_ns is the sum of the two below. */
+    uint64_t stall_ns;
+    uint64_t stall_cache_fill_ns;  /* waiting for the fill read */
+    uint64_t stall_writeback_ns;   /* waiting for the victim's line to free up */
+
+    /* Evictions that waited on an in-flight background writeback rather than
+     * programming the page themselves. These call no flush_pg(), so they leave
+     * no trace in w_writeback[]; count them to see whether modelling the
+     * in-flight state changes anything. */
+    uint64_t evict_inflight_waits;
 
     /* Mapped LPNs. U = live_pages / tt_pgs, the variable GC copy cost hinges on,
      * and the device-side cross-check for the guest's slow-tier usage. */
@@ -266,7 +318,8 @@ struct ssd_stats {
      * drives the wall-clock timing model, so file I/O here would distort it. */
     struct ssd_stats_sample *samples;
     int nr_samples;
-    uint64_t next_sample_w_host;
+    uint64_t next_sample_w_writeback;
+    uint64_t next_sample_reqs;
 };
 
 /* A TRIM range. The guest builds an array of these in its own RAM. */
@@ -316,6 +369,11 @@ struct ssd {
     struct ssd_channel *ch;
     struct SsdDramBackend *b;
     int buffer_way;
+    /* Background writeback watermarks as a percentage of cache lines. Runtime
+     * properties rather than constants because the sweep over them is the point
+     * of the experiment, and rebuilding per value is not practical. */
+    int wb_thres_pcent;      /* start cleaning above this share of dirty lines */
+    int wb_thres_pcent_low;  /* stop once back under this one */
 
     struct ppa *maptbl; /* page level mapping table */
     uint64_t *rmap;     /* reverse mapptbl, assume it's stored in OOB */

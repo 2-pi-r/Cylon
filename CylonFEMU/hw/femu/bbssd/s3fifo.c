@@ -29,19 +29,18 @@ static void insert_ghost(struct buffer *b, struct set *set, struct buffer_entry 
     }
 }
 
-static void process_victim(struct buffer *b, struct set* set, struct buffer_entry *victim) {
+static void process_victim(struct buffer *b, struct set* set, struct buffer_entry *victim,
+                           uint64_t *wait) {
     // assert(QTAILQ_NEXT(victim, b_entry) == NULL);
     // assert(QTAILQ_PREV(victim, b_entry) == NULL);
-    
-    /* Flush page to NAND */
-    if (victim->dirty) {
-        flush_pg(b->ssd, victim->lpn);
-        /*
-         * unlike other policies (entry freed on evict), this keeps the entry
-         * alive in ghost for possible re-promotion, so dirty must be cleared here.
-         */
-        victim->dirty = false;
-    }
+
+    /*
+     * Program it, or wait out a background writeback still in flight.
+     * buffer_evict_cost() also clears dirty, which matters more here than in the
+     * other policies: this keeps the entry alive in ghost for possible
+     * re-promotion instead of freeing it.
+     */
+    *wait += buffer_evict_cost(b, victim);
 
     g_tree_remove(b->tree, victim);	//remove from avl tree
     direct_mr_del(b, victim->lpn);
@@ -51,7 +50,7 @@ static void process_victim(struct buffer *b, struct set* set, struct buffer_entr
     set->cnt--;
 }
 
-static void evict_main(struct buffer *b, struct set *set) {
+static void evict_main(struct buffer *b, struct set *set, uint64_t *wait) {
     bool evicted = false;
     struct buffer_entry *victim = NULL;
 
@@ -79,14 +78,14 @@ static void evict_main(struct buffer *b, struct set *set) {
     if (victim != NULL) {
         assert(evicted == true);
         // printf("evicted from main, lpn: 0x%lx\n", victim->lpn);
-        process_victim(b, set, victim);
+        process_victim(b, set, victim, wait);
         /* Since the victim is not pushed to ghost, free memory */
         free(victim);
         
     }
 }
 
-static void evict_small(struct buffer *b, struct set *set) {
+static void evict_small(struct buffer *b, struct set *set, uint64_t *wait) {
     bool evicted = false;
 
     struct buffer_entry *victim = NULL;
@@ -102,7 +101,7 @@ static void evict_small(struct buffer *b, struct set *set) {
                 set->cnt_main++;
                 
                 while (set->cnt_main > s3_capM(ent_max)) {
-                    evict_main(b, set);
+                    evict_main(b, set, wait);
                 }
 
                 /* Since the victim is move to Main queue do not call process_victim */
@@ -123,11 +122,11 @@ static void evict_small(struct buffer *b, struct set *set) {
     if (victim != NULL) {
         assert(evicted == true);
         // printf("evicted, small to ghost, lpn: 0x%lx\n", victim->lpn);
-        process_victim(b, set, victim);
+        process_victim(b, set, victim, wait);
     }
 }
 
-int s3fifo_evict_victim(struct buffer *b, struct set *set)
+int s3fifo_evict_victim(struct buffer *b, struct set *set, uint64_t *wait)
 {
     struct buffer_entry *victim = NULL;
     int ent_max = (b->way == WAY_FULL) ? b->size : (1 << b->way);
@@ -136,15 +135,15 @@ int s3fifo_evict_victim(struct buffer *b, struct set *set)
         victim = set->entry;
         if (victim == NULL)
             return -1;
-        process_victim(b, set, victim);
+        process_victim(b, set, victim, wait);
     }
     else {
         /* Evict S */
         if (set->cnt_small > s3_capS(ent_max)) {
-            evict_small(b, set);
+            evict_small(b, set, wait);
         }
         else { /* Evict M */
-            evict_main(b, set);
+            evict_main(b, set, wait);
         }
     }
 
@@ -152,7 +151,7 @@ int s3fifo_evict_victim(struct buffer *b, struct set *set)
 }
 
 // static int a = 1;
-int s3fifo_insert_entry(struct buffer *b, struct buffer_entry *eptr)
+int s3fifo_insert_entry(struct buffer *b, struct buffer_entry *eptr, uint64_t *wait)
 {
     int ent_max = 0;
     struct set* set = buffer_get_set(b, eptr->lpn);
@@ -168,7 +167,8 @@ int s3fifo_insert_entry(struct buffer *b, struct buffer_entry *eptr)
         // fflush(stdout);
         
         while (!(set->cnt < ent_max)) {
-            s3fifo_evict_victim(b, set);
+            if (s3fifo_evict_victim(b, set, wait) < 0)
+                break;
         }
         
         //insert entry

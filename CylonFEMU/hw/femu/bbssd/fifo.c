@@ -1,7 +1,7 @@
 #include "buffer.h"
 
 
-int fifo_evict_victim(struct buffer *b, struct set *set)
+int fifo_evict_victim(struct buffer *b, struct set *set, uint64_t *wait)
 {
     struct buffer_entry *victim = NULL;
 
@@ -16,16 +16,15 @@ int fifo_evict_victim(struct buffer *b, struct set *set)
 		}
 		QTAILQ_REMOVE(&set->queue, victim, b_entry);	//remove from queue
 	}
-	
+
 	if (victim == NULL)
 		return -1;
 
 	// printf("evict 0x%lx, set idx: 0x%lx\n", victim->lpn, victim->lpn & (b->set_mask));
 	// fflush(stdout);
 
-	/* Flush page to NAND */
-	if (victim->dirty)
-		flush_pg(b->ssd, victim->lpn);
+	/* Program it, or wait out a background writeback still in flight */
+	*wait += buffer_evict_cost(b, victim);
 
 	g_tree_remove(b->tree, victim);	//remove from avl tree
 	direct_mr_del(b, victim->lpn);
@@ -58,6 +57,7 @@ int fifo_remove_entry(struct buffer *b, struct buffer_entry *ent)
 	g_tree_remove(b->tree, ent);
 	direct_mr_del(b, ent->lpn);
 
+	buffer_mark_dirty(b, ent, false);	/* discarded, so it stops counting */
 	free(ent);
 	b->entry_cnt--;
 	set->cnt--;
@@ -66,7 +66,7 @@ int fifo_remove_entry(struct buffer *b, struct buffer_entry *ent)
 }
 
 // static int a = 1;
-int fifo_insert_entry(struct buffer *b, struct buffer_entry *eptr)
+int fifo_insert_entry(struct buffer *b, struct buffer_entry *eptr, uint64_t *wait)
 {
 	int ent_max = 0;
 	struct set* set = buffer_get_set(b, eptr->lpn);
@@ -83,7 +83,8 @@ int fifo_insert_entry(struct buffer *b, struct buffer_entry *eptr)
 		// fflush(stdout);
 		
 		while (!(set->cnt < ent_max)) {
-			fifo_evict_victim(b, set);
+			if (fifo_evict_victim(b, set, wait) < 0)
+				break;
 		}
 		
 		//insert entry

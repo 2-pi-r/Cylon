@@ -624,6 +624,8 @@ static Property femu_props[] = {
     DEFINE_PROP_UINT8("replacement", FemuCtrl, rep, LIFO), /* 1=LIFO, 2=FIFO */
     DEFINE_PROP_UINT8("prefetch_degree", FemuCtrl, prefetch_degree, 0),
     DEFINE_PROP_UINT8("buffer_way", FemuCtrl, buffer_way, 0),
+    DEFINE_PROP_UINT8("wb_thres_pcent", FemuCtrl, wb_thres_pcent, 50),
+    DEFINE_PROP_UINT8("wb_thres_pcent_low", FemuCtrl, wb_thres_pcent_low, 45),
     DEFINE_PROP_UINT8("cxl_skip_ftl", FemuCtrl, cxl_skip_ftl, 0),
     // DEFINE_PROP_UINT64("base_gpa", FemuCtrl, base_gpa, 0),
     DEFINE_PROP_UINT32("namespaces", FemuCtrl, num_namespaces, 1),
