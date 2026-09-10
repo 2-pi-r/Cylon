@@ -602,9 +602,9 @@ static uint16_t get_lsa(struct FemuCtrl *n, void *buf, uint64_t size, uint64_t o
         // req_ftl(n, BUF_PRINT_STAT);
         fprintf(f,"NAND size: %d MB, Buffer size: %d MB, eviction: %s, prefetch: %d, way: %d, == %ld ==\n", n->memsz, n->bufsz, buffer->policy<POLICY_MAX? policy_str[buffer->policy]:"INVALID", buffer->degree, 1 << buffer->way, offset);
         fprintf(f,"Entry cnt: %ld/%ld\n", buffer->entry_cnt, buffer->size);
-        fprintf(f,"Buffer read: %lu hit/ %lu miss\n", buffer->read_hit, buffer->read_miss);
-        fprintf(f,"Buffer write: %lu hit/ %lu miss\n", buffer->write_hit, buffer->write_miss);
-        buffer->ins_cnt = buffer->evict_cnt = buffer->read_hit = buffer->read_miss = buffer->write_hit = buffer->write_miss = 0;
+        fprintf(f,"Buffer read: %lu hit_trapped/ %lu miss\n", buffer->read_hit_trapped, buffer->read_miss);
+        fprintf(f,"Buffer write: %lu hit_trapped/ %lu miss\n", buffer->write_hit_trapped, buffer->write_miss);
+        buffer->ins_cnt = buffer->evict_cnt = buffer->read_hit_trapped = buffer->read_miss = buffer->write_hit_trapped = buffer->write_miss = 0;
 
         break;
     case 2://flush buffer

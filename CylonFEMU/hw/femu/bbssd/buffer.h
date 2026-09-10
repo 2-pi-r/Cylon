@@ -10,7 +10,7 @@ struct ssd;
  * same either way, the caller decides what to do with the latency it returns. */
 enum {
     WRITEBACK_SRC_BACKGROUND = 0, /* watermark-driven, entry stays cached */
-    WRITEBACK_SRC_DEMAND     = 1, /* a miss needed the line, entry is evicted */
+    WRITEBACK_SRC_FOREGROUND = 1, /* a miss waited for it, entry is evicted */
     WRITEBACK_SRC_NR         = 2,
 };
 
@@ -135,9 +135,15 @@ struct buffer {
 
     struct buffer_ops ops;
 
-    uint64_t read_hit;
+    /* Hits the device actually saw. Inserting an entry clears the EPT MMIO flag
+     * (direct_mr_add), so a cached page is normally reached without a VM exit
+     * and never counted here. What is left is accesses that trapped anyway: a
+     * race with the insert, or a failed flag clear. A rising value means the
+     * direct-mapping path is failing -- it is not a hit rate. */
+    uint64_t read_hit_trapped;
+    uint64_t write_hit_trapped;
+    /* Misses always trap, so these are complete. */
     uint64_t read_miss;
-    uint64_t write_hit;
     uint64_t write_miss;
 
     uint64_t ins_cnt;
@@ -169,7 +175,7 @@ struct set* buffer_get_set(struct buffer *b, lpn_t lpn);
 
 // struct buffer_entry* buffer_select_victim(struct buffer *);
 // bool buffer_evict_victim(struct buffer *, struct buffer_entry *);
-/* Returns the time the requester must wait for the demand insert's eviction. */
+/* Returns the time the requester must wait for the foreground insert's eviction. */
 uint64_t buffer_insert_entry(struct buffer *, struct buffer_entry *, int);
 bool buffer_remove_entry(struct buffer *, lpn_t);
 void buffer_clear(struct buffer *);

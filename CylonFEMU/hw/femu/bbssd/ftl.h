@@ -244,15 +244,16 @@ struct ssd_stats_sample {
     uint64_t gc_lines_forced;
     uint64_t live_pages;
     uint64_t free_lines;
-    /* Buffer hit/miss, split by direction. Read misses are what a read-heavy
-     * workload actually waits on, so they carry the run time. */
-    uint64_t r_hit;
+    /* Buffer hit/miss, split by direction. Misses are complete and are what a
+     * request actually waits on; the hit counts only cover hits that trapped
+     * into the device, so they are not a hit rate (see struct buffer). */
+    uint64_t r_hit_trapped;
     uint64_t r_miss;
-    uint64_t w_hit;
+    uint64_t w_hit_trapped;
     uint64_t w_miss;
     uint64_t stall_ns;
     /* Appended, so column positions above do not move. */
-    uint64_t w_writeback_demand;  /* of w_writeback, the part a miss waited on */
+    uint64_t w_writeback_fg;      /* of w_writeback, the part a miss waited on */
     uint64_t r_cache_fill;
     uint64_t r_gc;
     uint64_t stall_cache_fill_ns;
@@ -267,7 +268,7 @@ struct ssd_stats {
      * stay flat after warm-up, otherwise the measured window isn't warmed up. */
     uint64_t w_first_touch;
     /* Indexed by WRITEBACK_SRC_*: background (watermark-driven, entry stays
-     * cached) vs demand (a miss needed the line and waited for the program). */
+     * cached) vs foreground (a miss needed the line and waited for the program). */
     uint64_t w_writeback[WRITEBACK_SRC_NR];
     uint64_t w_gc;             /* GC valid-page copies */
 

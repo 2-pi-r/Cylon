@@ -392,8 +392,9 @@ static void ssd_stats_sample(struct ssd *ssd)
     struct ssd_stats *st = &ssd->stats;
     struct buffer *b = &ssd->dram_buffer;
     uint64_t w_writeback = st->w_writeback[WRITEBACK_SRC_BACKGROUND] +
-                           st->w_writeback[WRITEBACK_SRC_DEMAND];
-    uint64_t reqs = b->read_hit + b->read_miss + b->write_hit + b->write_miss;
+                           st->w_writeback[WRITEBACK_SRC_FOREGROUND];
+    uint64_t reqs = b->read_hit_trapped + b->read_miss +
+                    b->write_hit_trapped + b->write_miss;
 
     /* Either counter making a period's worth of progress earns a sample, so a
      * phase that only reads is covered as densely as one that only writes. */
@@ -413,12 +414,12 @@ static void ssd_stats_sample(struct ssd *ssd)
         .gc_lines_forced      = st->gc_lines_forced,
         .live_pages           = st->live_pages,
         .free_lines           = ssd->lm.free_line_cnt,
-        .r_hit                = b->read_hit,
+        .r_hit_trapped        = b->read_hit_trapped,
         .r_miss               = b->read_miss,
-        .w_hit                = b->write_hit,
+        .w_hit_trapped        = b->write_hit_trapped,
         .w_miss               = b->write_miss,
         .stall_ns             = st->stall_ns,
-        .w_writeback_demand   = st->w_writeback[WRITEBACK_SRC_DEMAND],
+        .w_writeback_fg       = st->w_writeback[WRITEBACK_SRC_FOREGROUND],
         .r_cache_fill         = st->r_cache_fill,
         .r_gc                 = st->r_gc,
         .stall_cache_fill_ns  = st->stall_cache_fill_ns,
@@ -449,7 +450,8 @@ static void ssd_stats_reset(struct ssd *ssd)
     /* The buffer owns its hit/miss counters; zero them here so every counter
      * covers the same window. Cache contents are left alone -- this resets the
      * measurement, not the device. */
-    b->read_hit = b->read_miss = b->write_hit = b->write_miss = 0;
+    b->read_hit_trapped = b->read_miss = 0;
+    b->write_hit_trapped = b->write_miss = 0;
 
     /* live_pages is current device state, not an event count, so it survives */
 }
@@ -465,10 +467,10 @@ static void ssd_stats_dump(struct ssd *ssd)
     struct ssd_stats *st = &ssd->stats;
     struct buffer *b = &ssd->dram_buffer;
     uint64_t w_writeback = st->w_writeback[WRITEBACK_SRC_BACKGROUND] +
-                           st->w_writeback[WRITEBACK_SRC_DEMAND];
+                           st->w_writeback[WRITEBACK_SRC_FOREGROUND];
     uint64_t w_host = st->w_first_touch + w_writeback;
-    uint64_t reads = b->read_hit + b->read_miss;
-    uint64_t writes = b->write_hit + b->write_miss;
+    uint64_t reads = b->read_hit_trapped + b->read_miss;
+    uint64_t writes = b->write_hit_trapped + b->write_miss;
     const char *base = getenv("CYLON_STATS_PATH");
     char path[256];
     FILE *f;
@@ -485,20 +487,21 @@ static void ssd_stats_dump(struct ssd *ssd)
             st->live_pages, ssd->sp.tt_pgs,
             (double)st->live_pages / ssd->sp.tt_pgs);
 
-    /* A demand writeback is one a request had to wait through, so its share of
+    /* A foreground writeback is one a request had to wait through, so its share of
      * the total says how much of the write cost the guest actually saw. */
-    ftl_log("stats w_writeback_bg=%lu w_writeback_demand=%lu "
+    ftl_log("stats w_writeback_bg=%lu w_writeback_fg=%lu "
             "evict_inflight_waits=%lu dirty=%lu/%lu (hi=%lu lo=%lu)\n",
             st->w_writeback[WRITEBACK_SRC_BACKGROUND],
-            st->w_writeback[WRITEBACK_SRC_DEMAND],
+            st->w_writeback[WRITEBACK_SRC_FOREGROUND],
             st->evict_inflight_waits,
             b->dirty_cnt, b->size, b->dirty_hi, b->dirty_lo);
 
-    ftl_log("stats r_hit=%lu r_miss=%lu w_hit=%lu w_miss=%lu "
-            "r_hitrate=%.4f w_hitrate=%.4f entries=%lu/%lu way=%lu\n",
-            b->read_hit, b->read_miss, b->write_hit, b->write_miss,
-            reads ? (double)b->read_hit / reads : 0.0,
-            writes ? (double)b->write_hit / writes : 0.0,
+    /* No hit rate is printed: hits that never trap are not counted, so any ratio
+     * built from these would understate the real one by an unknown amount. */
+    ftl_log("stats r_hit_trapped=%lu r_miss=%lu w_hit_trapped=%lu w_miss=%lu "
+            "entries=%lu/%lu way=%lu\n",
+            b->read_hit_trapped, b->read_miss,
+            b->write_hit_trapped, b->write_miss,
             b->entry_cnt, b->size,
             /* Mirrors buffer_init_set(): WAY_FULL means one set holding
              * everything, not 1 << WAY_FULL ways. */
@@ -513,7 +516,7 @@ static void ssd_stats_dump(struct ssd *ssd)
             (reads + writes) ? (double)st->stall_ns / (reads + writes) : 0.0);
 
     /* writeback_share is what this whole change exists to measure: before the
-     * demand-wait path existed it was 0 by construction. */
+     * foreground-wait path existed it was 0 by construction. */
     ftl_log("stats stall_cache_fill_ns=%lu stall_writeback_ns=%lu "
             "writeback_share=%.4f\n",
             st->stall_cache_fill_ns, st->stall_writeback_ns,
@@ -541,8 +544,8 @@ static void ssd_stats_dump(struct ssd *ssd)
     /* New columns are appended, so column positions the analysis scripts
      * already use do not move. */
     fprintf(f, "time_ns,w_writeback,w_gc,gc_lines,gc_lines_forced,live_pages,"
-               "free_lines,r_hit,r_miss,w_hit,w_miss,stall_ns,"
-               "w_writeback_demand,r_cache_fill,r_gc,stall_cache_fill_ns,"
+               "free_lines,r_hit_trapped,r_miss,w_hit_trapped,w_miss,stall_ns,"
+               "w_writeback_fg,r_cache_fill,r_gc,stall_cache_fill_ns,"
                "stall_writeback_ns,evict_inflight_waits,dirty_cnt\n");
     for (int i = 0; i < st->nr_samples; i++) {
         struct ssd_stats_sample *s = &st->samples[i];
@@ -551,8 +554,9 @@ static void ssd_stats_dump(struct ssd *ssd)
                    "%lu,%lu,%lu,%lu,%lu,%lu,%lu\n",
                 s->time_ns, s->w_writeback, s->w_gc, s->gc_lines,
                 s->gc_lines_forced, s->live_pages, s->free_lines,
-                s->r_hit, s->r_miss, s->w_hit, s->w_miss, s->stall_ns,
-                s->w_writeback_demand, s->r_cache_fill, s->r_gc,
+                s->r_hit_trapped, s->r_miss, s->w_hit_trapped, s->w_miss,
+                s->stall_ns,
+                s->w_writeback_fg, s->r_cache_fill, s->r_gc,
                 s->stall_cache_fill_ns, s->stall_writeback_ns,
                 s->evict_inflight_waits, s->dirty_cnt);
     }
@@ -615,8 +619,8 @@ static void buffer_init(struct ssd *ssd)
 	 
 	buffer->bitmap = bitmap_new(spp->buffer_size);
 
-    buffer->read_hit = buffer->read_miss = 0; 
-    buffer->write_hit = buffer->write_miss = 0;
+    buffer->read_hit_trapped = buffer->read_miss = 0;
+    buffer->write_hit_trapped = buffer->write_miss = 0;
 
 	switch (buffer->policy)
 	{
@@ -1359,7 +1363,7 @@ static void *ftl_thread(void *arg)
     // FILE *f = fopen("/home/necsst/cxlssd_io.log", "a");
     while (1) {
         if (n->femu_mode == FEMU_CXLSSD_MODE) {
-            /* Clean ahead of demand so most evictions find a reusable line.
+            /* Clean ahead of the foreground path so most evictions find a reusable line.
              * How lazy this is set to is what decides how often a request ends
              * up waiting on a writeback, which is the effect being measured. */
             buffer_writeback_bg(buffer);
@@ -1448,8 +1452,8 @@ static void *ftl_thread(void *arg)
                     buffer_mark_dirty(buffer, bentry,
                                       (bentry->dirty==false && read)?false:true);
 
-                    if (read)   buffer->read_hit++;
-                    else        buffer->write_hit++;
+                    if (read)   buffer->read_hit_trapped++;
+                    else        buffer->write_hit_trapped++;
                     /* An entry already in the cache is never evicted by its own
                      * reinsertion, so this cannot wait. */
                     buffer_insert_entry(buffer, bentry, INSERT_NO_PREFETCH);
@@ -1582,7 +1586,7 @@ static void *ftl_thread(void *arg)
  * queueing already on the target LUN because swr.stime = 0 makes
  * ssd_advance_status() measure from the current clock. src only selects a
  * counter; the work done is identical either way, and it is the caller that
- * decides whether to charge that time to a request (demand eviction) or to
+ * decides whether to charge that time to a request (foreground eviction) or to
  * record it as a completion time (background writeback).
  */
 uint64_t flush_pg(struct ssd* ssd, lpn_t lpn, int src)

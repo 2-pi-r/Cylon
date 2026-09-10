@@ -154,7 +154,7 @@ struct set* buffer_get_set(struct buffer *b, lpn_t lpn)
 
 /*
  * Returns how long the requester must wait for the line this insert took. Only
- * the demand insert's wait is returned; see the note on the prefetch loop.
+ * the foreground insert's wait is returned; see the note on the prefetch loop.
  */
 uint64_t buffer_insert_entry(struct buffer *b, struct buffer_entry *bentry, int prefetch)
 {
@@ -225,7 +225,7 @@ uint64_t buffer_evict_cost(struct buffer *b, struct buffer_entry *victim)
 
 	if (victim->dirty) {
 		buffer_mark_dirty(b, victim, false);
-		return flush_pg(b->ssd, victim->lpn, WRITEBACK_SRC_DEMAND);
+		return flush_pg(b->ssd, victim->lpn, WRITEBACK_SRC_FOREGROUND);
 	}
 
 	now = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
@@ -250,7 +250,7 @@ static void writeback_entry(struct buffer *b, struct buffer_entry *ent)
 
 /* Scan in the order the eviction policy consumes the set, oldest first, so what
  * is cleaned is what is about to be evicted and any still-in-flight line a
- * demand eviction meets has the least time left. */
+ * foreground eviction meets has the least time left. */
 static void writeback_set(struct buffer *b, struct set *set)
 {
 	struct buffer_entry *ent;
@@ -333,7 +333,7 @@ void buffer_clear(struct buffer *buffer)
 				g_tree_remove(buffer->tree, buffer->sets[i].entry);
 				if (buffer->sets[i].entry->dirty)
 					flush_pg(buffer->ssd, buffer->sets[i].entry->lpn,
-						 WRITEBACK_SRC_DEMAND);
+						 WRITEBACK_SRC_FOREGROUND);
 				direct_mr_del(buffer, buffer->sets[i].entry->lpn);
 				free(buffer->sets[i].entry);
 			}
@@ -350,7 +350,7 @@ void buffer_clear(struct buffer *buffer)
 				QTAILQ_REMOVE(&set->queue, ent, b_entry);
 				
 				if (ent->dirty)
-					flush_pg(buffer->ssd, ent->lpn, WRITEBACK_SRC_DEMAND);
+					flush_pg(buffer->ssd, ent->lpn, WRITEBACK_SRC_FOREGROUND);
 				g_tree_remove(buffer->tree, ent);	//remove from avl tree
 				direct_mr_del(buffer, ent->lpn);
 
@@ -371,8 +371,8 @@ void buffer_clear(struct buffer *buffer)
 	buffer->dirty_cnt = 0;
 	buffer->wb_cursor = 0;
 
-    buffer->read_hit = buffer->read_miss = 0; 
-    buffer->write_hit = buffer->write_miss = 0;
+    buffer->read_hit_trapped = buffer->read_miss = 0;
+    buffer->write_hit_trapped = buffer->write_miss = 0;
 	buffer->entry_cnt = 0;
 
 	buffer->ins_cnt = 0;
