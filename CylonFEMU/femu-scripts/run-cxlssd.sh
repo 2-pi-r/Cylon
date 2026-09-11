@@ -30,7 +30,7 @@ prf_dg=0 # Next-n Prefetch degree
 
 # Configurable SSD Controller layout parameters (must be power of 2)
 ssd_size=$1		# in MegaBytes
-bufsz=$((ssd_size/20))
+bufsz=$((ssd_size/20)) # 20480 # $((ssd_size/20))
 skip_ftl=0
 
 
@@ -39,29 +39,68 @@ skip_ftl=0
 # since Cylon's cxl_warmup writes the full capacity during setup.
 # OP only grows FTL metadata, not actual memory (based on ssd_size).
 
-# 96GB (raw 108GB, OP 12.5%)
+# 96GB (raw ~123GB, OP 28%)
 if [ $ssd_size -eq 98304 ]
 then
     secsz=512		
     secs_per_pg=8
     pgs_per_blk=256
-    blks_per_pl=1728    # OP (blks_per_pl > ssd_size)
+    blks_per_pl=1966    # OP (blks_per_pl > ssd_size)
     pls_per_lun=1       # still not support multiplanes		
     luns_per_ch=8		
     nchs=8  			
 fi
 
-# 48GB (raw 54GB, OP 12.5%)
+# 48GB (raw ~61.5GB, OP 28%)
 if [ $ssd_size -eq 49152 ]
 then
     secsz=512		
     secs_per_pg=8
     pgs_per_blk=256
-    blks_per_pl=864     # OP (blks_per_pl > ssd_size)
+    blks_per_pl=983     # OP (blks_per_pl > ssd_size)
     pls_per_lun=1       # still not support multiplanes		
     luns_per_ch=8		
     nchs=8  			
 fi
+
+# 40GB (raw ~52.4GB, OP ~28%)
+if [ $ssd_size -eq 40960 ]
+then
+    secsz=512
+    secs_per_pg=8
+    pgs_per_blk=256
+    blks_per_pl=819     # OP (blks_per_pl > ssd_size)
+    pls_per_lun=1
+    luns_per_ch=8
+    nchs=8
+fi
+
+# 64GB (raw ~82GB, OP 28%)
+if [ $ssd_size -eq 65536 ]
+then
+    secsz=512
+    secs_per_pg=8
+    pgs_per_blk=256
+    blks_per_pl=1311    # OP (blks_per_pl > ssd_size)
+    pls_per_lun=1       # still not support multiplanes
+    luns_per_ch=8
+    nchs=8
+fi
+
+# 32GB (raw ~41GB, OP 28%)
+if [ $ssd_size -eq 32768 ]
+then
+    secsz=512
+    secs_per_pg=8
+    pgs_per_blk=256
+    blks_per_pl=656     # OP (blks_per_pl > ssd_size)
+    pls_per_lun=1       # still not support multiplanes
+    luns_per_ch=8
+    nchs=8
+fi
+
+
+
 
 
 # Latency in nanoseconds
