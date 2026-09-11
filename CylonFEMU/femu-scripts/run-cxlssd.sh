@@ -5,10 +5,8 @@ if [[ ! -e "$1" ]]; then
     echo "usage: $0 [ssd_size (MB)]"
 fi
 
-# Image directory
-# IMGDIR=$HOME/images
-IMGDIR=~/images
 # Virtual machine disk image
+IMGDIR=~/Cylon
 OSIMGF=$IMGDIR/ubuntu22.qcow2
 
 if [[ ! -e "$OSIMGF" ]]; then
@@ -22,12 +20,9 @@ fi
 
 
 # CXL-SSD backend memory parameters
-# backend_dev="/dev/mem"
-# bdev_offset=0xae80000000
-
-backend_dev="/dev/cmahog"
-bdev_offset=0
-hpa_base=0xae80000000
+backend_dev="/dev/mem"
+bdev_offset=0x2800000000
+hpa_base=0x2800000000
 
 # CXL-SSD DRAM buffer parameters
 policy=2 # Replacement policy [1:LIFO 2:FIFO 3:S3FIFO 4:CLOCK]
@@ -130,7 +125,7 @@ sudo x86_64-softmmu/qemu-system-x86_64 \
     --overcommit cpu-pm=on \
     -device virtio-scsi-pci,id=scsi0 \
     -device scsi-hd,drive=hd0 \
-    -drive file=$OSIMGF,if=none,aio=native,cache=none,format=qcow2,id=hd0\
+    -drive file=$OSIMGF,if=none,aio=threads,cache=writeback,format=qcow2,id=hd0\
     ${FEMU_OPTIONS} \
     -device pxb-cxl,bus_nr=12,bus=pcie.0,id=cxl.1 \
     -device cxl-rp,port=0,bus=cxl.1,id=root_port13,chassis=0,slot=2 \
