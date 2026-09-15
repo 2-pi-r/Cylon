@@ -373,8 +373,8 @@ struct ssd {
     /* Background writeback watermarks as a percentage of cache lines. Runtime
      * properties rather than constants because the sweep over them is the point
      * of the experiment, and rebuilding per value is not practical. */
-    int wb_thres_pcent;      /* start cleaning above this share of dirty lines */
-    int wb_thres_pcent_low;  /* stop once back under this one */
+    int writeback_watermark_high; /* start cleaning above this share of dirty lines */
+    int writeback_watermark_low;  /* stop once back under this one */
 
     struct ppa *maptbl; /* page level mapping table */
     uint64_t *rmap;     /* reverse mapptbl, assume it's stored in OOB */

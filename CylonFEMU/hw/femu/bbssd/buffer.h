@@ -105,17 +105,23 @@ struct buffer {
 
     uint64_t size; /* # of entries */
     uint64_t entry_cnt;
+    /* Original Cylon. Occupancy (not dirty) ratios at which the cache was to be
+     * considered full / force-evicted, both set to ~1.0 so they never fired.
+     * Now dead: buffer_full() has no live caller and buffer_force_eviction() is
+     * commented out. Eviction happens per-set on insert instead. Left in place
+     * to keep the diff against original Cylon small. */
     double thres_pcent;
     double force_pcent;
 
-    /* Background writeback watermarks, in entries. Dirty lines rather than
+    /* Background writeback watermarks as line counts, derived once from
+     * ssd->writeback_watermark_high/_low (percentages). Dirty lines rather than
      * occupied ones because the cache is always full after warm-up, so
-     * entry_cnt never moves. (dirty_hi - dirty_lo) also bounds how much one
+     * entry_cnt never moves. The gap between the two also bounds how much one
      * pass writes back, so there is no separate batch limit. */
     uint64_t dirty_cnt;
-    uint64_t dirty_hi;
-    uint64_t dirty_lo;
-    uint64_t wb_cursor;  /* set to resume the background scan from */
+    uint64_t dirty_lines_high;
+    uint64_t dirty_lines_low;
+    uint64_t writeback_cursor;  /* set to resume the background scan from */
 
 	GTree *tree;
     GTree *ghost_tree;
@@ -190,7 +196,7 @@ void buffer_mark_dirty(struct buffer *b, struct buffer_entry *ent, bool dirty);
  * here, so the dirty/in-flight/clean rule lives in one place. */
 uint64_t buffer_evict_cost(struct buffer *b, struct buffer_entry *victim);
 
-/* Watermark-driven background writeback; see struct buffer's dirty_hi/dirty_lo. */
+/* Watermark-driven background writeback; see struct buffer's dirty watermarks. */
 void buffer_writeback_bg(struct buffer *b);
 
 

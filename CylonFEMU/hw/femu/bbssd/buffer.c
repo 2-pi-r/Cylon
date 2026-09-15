@@ -263,29 +263,30 @@ static void writeback_set(struct buffer *b, struct set *set)
 	}
 
 	QTAILQ_FOREACH(ent, &set->queue, b_entry) {
-		if (b->dirty_cnt <= b->dirty_lo)
+		if (b->dirty_cnt <= b->dirty_lines_low)
 			return;
 		if (ent->dirty)
 			writeback_entry(b, ent);
 	}
 }
 
-/* Start above dirty_hi, run until below dirty_lo, so the band width also caps
- * one pass. Deliberately unthrottled beyond that: a writeback backlog delaying
- * later NAND work is exactly the write cost this is meant to expose. */
+/* Start above the high watermark, run until below the low one, so the gap
+ * between them also caps one pass. Deliberately unthrottled beyond that: a
+ * writeback backlog delaying later NAND work is exactly the write cost this is
+ * meant to expose. */
 void buffer_writeback_bg(struct buffer *b)
 {
 	uint64_t n_set, scanned;
 
-	if (b->size == 0 || b->dirty_cnt <= b->dirty_hi)
+	if (b->size == 0 || b->dirty_cnt <= b->dirty_lines_high)
 		return;
 
 	n_set = b->set_mask ? b->set_mask : 1;
 	for (scanned = 0; scanned < n_set; scanned++) {
-		if (b->dirty_cnt <= b->dirty_lo)
+		if (b->dirty_cnt <= b->dirty_lines_low)
 			break;
-		writeback_set(b, &b->sets[b->wb_cursor]);
-		b->wb_cursor = (b->wb_cursor + 1) % n_set;
+		writeback_set(b, &b->sets[b->writeback_cursor]);
+		b->writeback_cursor = (b->writeback_cursor + 1) % n_set;
 	}
 }
 
@@ -369,7 +370,7 @@ void buffer_clear(struct buffer *buffer)
 
 	/* Every entry is gone, so nothing is dirty and the scan restarts. */
 	buffer->dirty_cnt = 0;
-	buffer->wb_cursor = 0;
+	buffer->writeback_cursor = 0;
 
     buffer->read_hit_trapped = buffer->read_miss = 0;
     buffer->write_hit_trapped = buffer->write_miss = 0;

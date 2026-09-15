@@ -103,9 +103,6 @@ then
 fi
 
 
-
-
-
 # Latency in nanoseconds
 pg_rd_lat=40000
 pg_wr_lat=200000
@@ -148,7 +145,6 @@ FEMU_OPTIONS=${FEMU_OPTIONS}",buffer_way=${way}"
 FEMU_OPTIONS=${FEMU_OPTIONS}",writeback_watermark_high=${writeback_watermark_high}"
 FEMU_OPTIONS=${FEMU_OPTIONS}",writeback_watermark_low=${writeback_watermark_low}"
 
-
 echo ${FEMU_OPTIONS}
 
 nr_hugepages=$((ssd_size/2))
@@ -162,6 +158,8 @@ dram_size=16G
 
 sudo x86_64-softmmu/qemu-system-x86_64 \
     -name "FEMU-CXLSSD-VM" \
+-netdev tap,id=net1,ifname=tap0,script=no,downscript=no \
+    -device virtio-net-pci,netdev=net1,mac=52:54:00:12:34:57 \
     -machine type=q35,accel=kvm,nvdimm=on,cxl=on -enable-kvm \
     -cpu host \
     -smp $n_threads \

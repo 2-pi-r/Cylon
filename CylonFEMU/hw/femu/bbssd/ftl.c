@@ -494,7 +494,7 @@ static void ssd_stats_dump(struct ssd *ssd)
             st->w_writeback[WRITEBACK_SRC_BACKGROUND],
             st->w_writeback[WRITEBACK_SRC_FOREGROUND],
             st->evict_inflight_waits,
-            b->dirty_cnt, b->size, b->dirty_hi, b->dirty_lo);
+            b->dirty_cnt, b->size, b->dirty_lines_high, b->dirty_lines_low);
 
     /* No hit rate is printed: hits that never trap are not counted, so any ratio
      * built from these would understate the real one by an unknown amount. */
@@ -591,16 +591,16 @@ static void buffer_init(struct ssd *ssd)
     buffer->force_pcent = 0.99999;
 	buffer->entry_cnt = 0;
 
-    /* Background writeback watermarks, converted from percent to entries once.
-     * The band width (hi - lo) is also how much a single pass writes back, so
-     * a narrow band means frequent small passes. Guard against a low >= high
+    /* Background writeback watermarks, converted from percent to line counts
+     * once. The gap between the two is also how much a single pass writes back,
+     * so a narrow gap means frequent small passes. Guard against a low >= high
      * that would make the hysteresis meaningless. */
     buffer->dirty_cnt = 0;
-    buffer->wb_cursor = 0;
-    buffer->dirty_hi = buffer->size * ssd->wb_thres_pcent / 100;
-    buffer->dirty_lo = buffer->size * ssd->wb_thres_pcent_low / 100;
-    if (buffer->dirty_lo >= buffer->dirty_hi)
-        buffer->dirty_lo = buffer->dirty_hi / 2;
+    buffer->writeback_cursor = 0;
+    buffer->dirty_lines_high = buffer->size * ssd->writeback_watermark_high / 100;
+    buffer->dirty_lines_low = buffer->size * ssd->writeback_watermark_low / 100;
+    if (buffer->dirty_lines_low >= buffer->dirty_lines_high)
+        buffer->dirty_lines_low = buffer->dirty_lines_high / 2;
 
     buffer->policy = spp->policy;
     buffer->degree = spp->degree;
@@ -673,8 +673,8 @@ void ssd_init(FemuCtrl *n)
     struct ssdparams *spp = &ssd->sp;
     ssd->b = n->mbe;
     ssd->buffer_way = n->buffer_way;
-    ssd->wb_thres_pcent = n->wb_thres_pcent;
-    ssd->wb_thres_pcent_low = n->wb_thres_pcent_low;
+    ssd->writeback_watermark_high = n->writeback_watermark_high;
+    ssd->writeback_watermark_low = n->writeback_watermark_low;
 
     ftl_assert(ssd);
 
