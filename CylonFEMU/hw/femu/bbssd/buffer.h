@@ -128,9 +128,9 @@ struct buffer {
     uint64_t dirty_lines_high;
     uint64_t dirty_lines_low;
     uint64_t writeback_cursor;  /* set to resume the background scan from */
-    /* When the die-availability gate first refused, 0 while it is not refusing.
-     * Collapses the many refusals one spin loop produces into a single time
-     * span for stats.writeback_bg_blocked_ns. */
+    /* When the issue limit first refused, 0 while it is not refusing. Collapses
+     * the many refusals one spin loop produces into a single time span for
+     * stats.writeback_bg_blocked_ns. */
     uint64_t writeback_blocked_since;
 
 	GTree *tree;
@@ -156,11 +156,14 @@ struct buffer {
      * and never counted here. What is left is accesses that trapped anyway: a
      * race with the insert, or a failed flag clear. A rising value means the
      * direct-mapping path is failing -- it is not a hit rate. */
-    uint64_t read_hit_trapped;
-    uint64_t write_hit_trapped;
-    /* Misses always trap, so these are complete. */
-    uint64_t read_miss;
-    uint64_t write_miss;
+    uint64_t load_hit_trapped;
+    uint64_t store_hit_trapped;
+    /* Misses always trap, so these are complete. load/store is the guest
+     * instruction, not a NAND direction: a store miss on a mapped LPN also does
+     * a fill read (r_cache_fill) and only marks the line dirty, so its NAND
+     * program happens later, at writeback. */
+    uint64_t load_miss;
+    uint64_t store_miss;
 
     uint64_t ins_cnt;
     uint64_t evict_cnt;

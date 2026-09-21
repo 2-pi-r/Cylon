@@ -405,8 +405,8 @@ void buffer_clear(struct buffer *buffer)
 	buffer->writeback_cursor = 0;
 	buffer->writeback_blocked_since = 0;
 
-    buffer->read_hit_trapped = buffer->read_miss = 0;
-    buffer->write_hit_trapped = buffer->write_miss = 0;
+    buffer->load_hit_trapped = buffer->load_miss = 0;
+    buffer->store_hit_trapped = buffer->store_miss = 0;
 	buffer->entry_cnt = 0;
 
 	buffer->ins_cnt = 0;

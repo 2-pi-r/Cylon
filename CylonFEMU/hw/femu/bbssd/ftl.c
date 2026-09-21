@@ -393,8 +393,8 @@ static void ssd_stats_sample(struct ssd *ssd)
     struct buffer *b = &ssd->dram_buffer;
     uint64_t w_writeback = st->w_writeback[WRITEBACK_SRC_BACKGROUND] +
                            st->w_writeback[WRITEBACK_SRC_FOREGROUND];
-    uint64_t reqs = b->read_hit_trapped + b->read_miss +
-                    b->write_hit_trapped + b->write_miss;
+    uint64_t reqs = b->load_hit_trapped + b->load_miss +
+                    b->store_hit_trapped + b->store_miss;
 
     /* Either counter making a period's worth of progress earns a sample, so a
      * phase that only reads is covered as densely as one that only writes. */
@@ -414,10 +414,10 @@ static void ssd_stats_sample(struct ssd *ssd)
         .gc_lines_forced      = st->gc_lines_forced,
         .live_pages           = st->live_pages,
         .free_lines           = ssd->lm.free_line_cnt,
-        .r_hit_trapped        = b->read_hit_trapped,
-        .r_miss               = b->read_miss,
-        .w_hit_trapped        = b->write_hit_trapped,
-        .w_miss               = b->write_miss,
+        .load_hit_trapped     = b->load_hit_trapped,
+        .load_miss            = b->load_miss,
+        .store_hit_trapped    = b->store_hit_trapped,
+        .store_miss           = b->store_miss,
         .stall_ns             = st->stall_ns,
         .w_writeback_fg       = st->w_writeback[WRITEBACK_SRC_FOREGROUND],
         .r_cache_fill         = st->r_cache_fill,
@@ -454,8 +454,8 @@ static void ssd_stats_reset(struct ssd *ssd)
     /* The buffer owns its hit/miss counters; zero them here so every counter
      * covers the same window. Cache contents are left alone -- this resets the
      * measurement, not the device. */
-    b->read_hit_trapped = b->read_miss = 0;
-    b->write_hit_trapped = b->write_miss = 0;
+    b->load_hit_trapped = b->load_miss = 0;
+    b->store_hit_trapped = b->store_miss = 0;
 
     /* live_pages is current device state, not an event count, so it survives */
 }
@@ -473,8 +473,8 @@ static void ssd_stats_dump(struct ssd *ssd)
     uint64_t w_writeback = st->w_writeback[WRITEBACK_SRC_BACKGROUND] +
                            st->w_writeback[WRITEBACK_SRC_FOREGROUND];
     uint64_t w_host = st->w_first_touch + w_writeback;
-    uint64_t reads = b->read_hit_trapped + b->read_miss;
-    uint64_t writes = b->write_hit_trapped + b->write_miss;
+    uint64_t loads = b->load_hit_trapped + b->load_miss;
+    uint64_t stores = b->store_hit_trapped + b->store_miss;
     const char *base = getenv("CYLON_STATS_PATH");
     char path[256];
     FILE *f;
@@ -500,9 +500,9 @@ static void ssd_stats_dump(struct ssd *ssd)
             st->evict_inflight_waits,
             b->dirty_cnt, b->size, b->dirty_lines_high, b->dirty_lines_low);
 
-    /* bg_blocked_s says whether the gate bound background writeback at all;
-     * die_queue_ahead_max is the GC burst the gate deliberately ignores, so a
-     * large value there is the first thing to look at if the gate did nothing. */
+    /* bg_blocked_s says whether the issue limit bound background writeback at
+     * all; die_backlog_max is the GC burst the limit deliberately ignores, so a
+     * large value there is the first thing to look at if nothing was bound. */
     ftl_log("stats writeback_die_queue_depth=%d bg_blocked_ns=%lu bg_blocked_s=%.3f "
             "die_backlog_max_ns=%lu die_backlog_max_ms=%.3f\n",
             ssd->writeback_die_queue_depth,
@@ -511,10 +511,10 @@ static void ssd_stats_dump(struct ssd *ssd)
 
     /* No hit rate is printed: hits that never trap are not counted, so any ratio
      * built from these would understate the real one by an unknown amount. */
-    ftl_log("stats r_hit_trapped=%lu r_miss=%lu w_hit_trapped=%lu w_miss=%lu "
+    ftl_log("stats load_hit_trapped=%lu load_miss=%lu store_hit_trapped=%lu store_miss=%lu "
             "entries=%lu/%lu way=%lu\n",
-            b->read_hit_trapped, b->read_miss,
-            b->write_hit_trapped, b->write_miss,
+            b->load_hit_trapped, b->load_miss,
+            b->store_hit_trapped, b->store_miss,
             b->entry_cnt, b->size,
             /* Mirrors buffer_init_set(): WAY_FULL means one set holding
              * everything, not 1 << WAY_FULL ways. */
@@ -526,7 +526,7 @@ static void ssd_stats_dump(struct ssd *ssd)
     ftl_log("stats r_cache_fill=%lu r_gc=%lu stall_ns=%lu stall_s=%.3f "
             "mean_stall_ns=%.1f\n",
             st->r_cache_fill, st->r_gc, st->stall_ns, st->stall_ns / 1e9,
-            (reads + writes) ? (double)st->stall_ns / (reads + writes) : 0.0);
+            (loads + stores) ? (double)st->stall_ns / (loads + stores) : 0.0);
 
     /* writeback_share is what this whole change exists to measure: before the
      * foreground-wait path existed it was 0 by construction. */
@@ -557,7 +557,7 @@ static void ssd_stats_dump(struct ssd *ssd)
     /* New columns are appended, so column positions the analysis scripts
      * already use do not move. */
     fprintf(f, "time_ns,w_writeback,w_gc,gc_lines,gc_lines_forced,live_pages,"
-               "free_lines,r_hit_trapped,r_miss,w_hit_trapped,w_miss,stall_ns,"
+               "free_lines,load_hit_trapped,load_miss,store_hit_trapped,store_miss,stall_ns,"
                "w_writeback_fg,r_cache_fill,r_gc,stall_cache_fill_ns,"
                "stall_writeback_ns,evict_inflight_waits,dirty_cnt,"
                "writeback_bg_blocked_ns,die_backlog_max_ns\n");
@@ -568,7 +568,7 @@ static void ssd_stats_dump(struct ssd *ssd)
                    "%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu\n",
                 s->time_ns, s->w_writeback, s->w_gc, s->gc_lines,
                 s->gc_lines_forced, s->live_pages, s->free_lines,
-                s->r_hit_trapped, s->r_miss, s->w_hit_trapped, s->w_miss,
+                s->load_hit_trapped, s->load_miss, s->store_hit_trapped, s->store_miss,
                 s->stall_ns,
                 s->w_writeback_fg, s->r_cache_fill, s->r_gc,
                 s->stall_cache_fill_ns, s->stall_writeback_ns,
@@ -635,8 +635,8 @@ static void buffer_init(struct ssd *ssd)
 	 
 	buffer->bitmap = bitmap_new(spp->buffer_size);
 
-    buffer->read_hit_trapped = buffer->read_miss = 0;
-    buffer->write_hit_trapped = buffer->write_miss = 0;
+    buffer->load_hit_trapped = buffer->load_miss = 0;
+    buffer->store_hit_trapped = buffer->store_miss = 0;
 
 	switch (buffer->policy)
 	{
@@ -1469,8 +1469,8 @@ static void *ftl_thread(void *arg)
                     buffer_mark_dirty(buffer, bentry,
                                       (bentry->dirty==false && read)?false:true);
 
-                    if (read)   buffer->read_hit_trapped++;
-                    else        buffer->write_hit_trapped++;
+                    if (read)   buffer->load_hit_trapped++;
+                    else        buffer->store_hit_trapped++;
                     /* An entry already in the cache is never evicted by its own
                      * reinsertion, so this cannot wait. */
                     buffer_insert_entry(buffer, bentry, INSERT_NO_PREFETCH);
@@ -1479,8 +1479,8 @@ static void *ftl_thread(void *arg)
                     bentry = buffer_entry_init(buffer, lpn);
                     buffer_mark_dirty(buffer, bentry, read?false:true);
 
-                    if (read)   buffer->read_miss++;
-                    else        buffer->write_miss++;
+                    if (read)   buffer->load_miss++;
+                    else        buffer->store_miss++;
 
                     /* Take the line first. If its victim is still dirty, or a
                      * background writeback of it is still in flight, the line is
@@ -1597,7 +1597,7 @@ static void *ftl_thread(void *arg)
  * single pass programs the whole watermark gap and an eviction then never meets
  * a dirty or in-flight line, which is why the foreground path never fired. GC is
  * left out of the backlog because do_gc() copies a line in one burst where a
- * real controller interleaves it; counting it would shut the gate that long. */
+ * real controller interleaves it; counting it would block issuing that long. */
 bool writeback_die_has_room(struct ssd *ssd, uint64_t now)
 {
     struct ppa ppa = get_new_page(ssd);   /* write pointer, no side effect */
@@ -1611,8 +1611,8 @@ bool writeback_die_has_room(struct ssd *ssd, uint64_t now)
             ssd->stats.die_backlog_max_ns = backlog;
     }
 
-    /* pg_wr_lat is 0 while delay emulation is off; the gate would then never
-     * open, so treat it as no limit. */
+    /* pg_wr_lat is 0 while delay emulation is off; issuing would then never be
+     * allowed, so treat it as no limit. */
     if (ssd->writeback_die_queue_depth == 0 || ssd->sp.pg_wr_lat == 0)
         return true;
 

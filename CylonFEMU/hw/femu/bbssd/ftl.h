@@ -244,13 +244,14 @@ struct ssd_stats_sample {
     uint64_t gc_lines_forced;
     uint64_t live_pages;
     uint64_t free_lines;
-    /* Buffer hit/miss, split by direction. Misses are complete and are what a
-     * request actually waits on; the hit counts only cover hits that trapped
-     * into the device, so they are not a hit rate (see struct buffer). */
-    uint64_t r_hit_trapped;
-    uint64_t r_miss;
-    uint64_t w_hit_trapped;
-    uint64_t w_miss;
+    /* Buffer hit/miss, split by the guest instruction that caused it rather
+     * than by NAND direction. Misses are complete and are what a request waits
+     * on; the hit counts only cover hits that trapped into the device, so they
+     * are not a hit rate (see struct buffer). */
+    uint64_t load_hit_trapped;
+    uint64_t load_miss;
+    uint64_t store_hit_trapped;
+    uint64_t store_miss;
     uint64_t stall_ns;
     /* Appended, so column positions above do not move. */
     uint64_t w_writeback_fg;      /* of w_writeback, the part a miss waited on */
@@ -281,7 +282,7 @@ struct ssd_stats {
 
     /* NAND page reads that filled the cache after a miss on a mapped LPN. Named
      * for the cause, like the w_* counters, so distinct from r_gc. Smaller than
-     * read_miss + write_miss: a miss on an unmapped LPN reads nothing. Holds for
+     * load_miss + store_miss: a miss on an unmapped LPN reads nothing. Holds for
      * write misses too -- those fill the line as well. */
     uint64_t r_cache_fill;
     /* NAND page reads GC does before copying a valid page. Always equal to w_gc,
@@ -304,15 +305,15 @@ struct ssd_stats {
      * in-flight state changes anything. */
     uint64_t evict_inflight_waits;
 
-    /* Wall-clock time the die-availability gate held background writeback off
-     * while the dirty count sat above the high watermark. Time rather than a
-     * call count because buffer_writeback_bg() runs from the FTL thread's spin
-     * loop, so a counter would only measure how fast that loop turns. */
+    /* Wall-clock time the issue limit held background writeback off while the
+     * dirty count sat above the high watermark. Time rather than a call count
+     * because buffer_writeback_bg() runs from the FTL thread's spin loop, so a
+     * counter would only measure how fast that loop turns. */
     uint64_t writeback_bg_blocked_ns;
     /* Largest gap seen between a die's next-free time and the wall clock, at the
      * moments background writeback wanted to issue. GC copies a whole line in
-     * one synchronous burst, so this is dominated by GC and says how much the
-     * gate would tighten if it stopped excluding GC. */
+     * one synchronous burst, so this is dominated by GC and says how much
+     * tighter the limit would get if it stopped excluding GC. */
     uint64_t die_backlog_max_ns;
 
     /* Mapped LPNs. U = live_pages / tt_pgs, the variable GC copy cost hinges on,
