@@ -283,8 +283,13 @@ struct ssd_stats {
     /* NAND page reads that filled the cache after a miss on a mapped LPN. Named
      * for the cause, like the w_* counters, so distinct from r_gc. Smaller than
      * load_miss + store_miss: a miss on an unmapped LPN reads nothing. Holds for
-     * write misses too -- those fill the line as well. */
+     * store misses too -- those fill the line as well. */
     uint64_t r_cache_fill;
+    /* Of r_cache_fill, the part a store miss caused. Should be near zero: store
+     * misses are demotion copies into a freshly trimmed page, which is unmapped
+     * and so fills nothing. A large value would mean guest stores to resident
+     * slow-tier pages are a real share of the fills. */
+    uint64_t r_cache_fill_store;
     /* NAND page reads GC does before copying a valid page. Always equal to w_gc,
      * so derivable, but device load is r_cache_fill + r_gc + w_writeback + w_gc
      * and this half is easy to forget. */

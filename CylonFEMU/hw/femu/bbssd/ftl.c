@@ -439,7 +439,7 @@ static void ssd_stats_reset(struct ssd *ssd)
     st->w_first_touch = st->w_gc = 0;
     memset(st->w_writeback, 0, sizeof(st->w_writeback));
     st->gc_lines = st->gc_lines_forced = st->gc_forced_novictim = 0;
-    st->r_cache_fill = st->r_gc = 0;
+    st->r_cache_fill = st->r_cache_fill_store = st->r_gc = 0;
     st->stall_ns = st->stall_cache_fill_ns = st->stall_writeback_ns = 0;
     st->evict_inflight_waits = 0;
     st->writeback_bg_blocked_ns = st->die_backlog_max_ns = 0;
@@ -527,6 +527,13 @@ static void ssd_stats_dump(struct ssd *ssd)
             "mean_stall_ns=%.1f\n",
             st->r_cache_fill, st->r_gc, st->stall_ns, st->stall_ns / 1e9,
             (loads + stores) ? (double)st->stall_ns / (loads + stores) : 0.0);
+
+    /* Only the store half is counted, so derive the load half here. */
+    ftl_log("stats r_cache_fill_load=%lu r_cache_fill_store=%lu "
+            "store_share=%.4f\n",
+            st->r_cache_fill - st->r_cache_fill_store, st->r_cache_fill_store,
+            st->r_cache_fill ?
+                (double)st->r_cache_fill_store / st->r_cache_fill : 0.0);
 
     /* writeback_share is what this whole change exists to measure: before the
      * foreground-wait path existed it was 0 by construction. */
@@ -1495,6 +1502,8 @@ static void *ftl_thread(void *arg)
                         creq->ncmd->cmd = NAND_READ;
                         lat += ssd_advance_status(ssd, &ppa, creq->ncmd);
                         ssd->stats.r_cache_fill++;
+                        if (!read)
+                            ssd->stats.r_cache_fill_store++;
                         // backend_memcpy(ssd, ppa, bentry->idx, NAND_TO_BUF);
                     }
                     /* Unmapped LPN (no NAND page backs it yet). The original
