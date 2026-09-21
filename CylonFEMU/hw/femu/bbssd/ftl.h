@@ -260,6 +260,8 @@ struct ssd_stats_sample {
     uint64_t stall_writeback_ns;
     uint64_t evict_inflight_waits;
     uint64_t dirty_cnt;           /* shows the watermark band being worked */
+    uint64_t writeback_bg_blocked_ns;
+    uint64_t die_backlog_max_ns;
 };
 
 struct ssd_stats {
@@ -301,6 +303,17 @@ struct ssd_stats {
      * no trace in w_writeback[]; count them to see whether modelling the
      * in-flight state changes anything. */
     uint64_t evict_inflight_waits;
+
+    /* Wall-clock time the die-availability gate held background writeback off
+     * while the dirty count sat above the high watermark. Time rather than a
+     * call count because buffer_writeback_bg() runs from the FTL thread's spin
+     * loop, so a counter would only measure how fast that loop turns. */
+    uint64_t writeback_bg_blocked_ns;
+    /* Largest gap seen between a die's next-free time and the wall clock, at the
+     * moments background writeback wanted to issue. GC copies a whole line in
+     * one synchronous burst, so this is dominated by GC and says how much the
+     * gate would tighten if it stopped excluding GC. */
+    uint64_t die_backlog_max_ns;
 
     /* Mapped LPNs. U = live_pages / tt_pgs, the variable GC copy cost hinges on,
      * and the device-side cross-check for the guest's slow-tier usage. */
@@ -375,6 +388,9 @@ struct ssd {
      * of the experiment, and rebuilding per value is not practical. */
     int writeback_watermark_high; /* start cleaning above this share of dirty lines */
     int writeback_watermark_low;  /* stop once back under this one */
+    /* Programs background writeback may leave outstanding on one die; 0 = no
+     * limit. See writeback_die_has_room(). */
+    int writeback_die_queue_depth;
 
     struct ppa *maptbl; /* page level mapping table */
     uint64_t *rmap;     /* reverse mapptbl, assume it's stored in OOB */

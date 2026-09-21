@@ -249,43 +249,75 @@ static void writeback_entry(struct buffer *b, struct buffer_entry *ent)
 }
 
 /* Scan in the order the eviction policy consumes the set, oldest first, so what
- * is cleaned is what is about to be evicted and any still-in-flight line a
- * foreground eviction meets has the least time left. */
-static void writeback_set(struct buffer *b, struct set *set)
+ * is cleaned is what is about to be evicted and an in-flight line a foreground
+ * eviction meets has the least time left. Returns false when the die filled up;
+ * the caller then stops the whole pass, since flush_pg() always programs at the
+ * current write pointer and another set would meet the same die. */
+static bool writeback_set(struct buffer *b, struct set *set)
 {
 	struct buffer_entry *ent;
 
 	if (b->way == WAY_1) {
 		ent = set->entry;
-		if (ent && ent->dirty)
-			writeback_entry(b, ent);
-		return;
+		if (!ent || !ent->dirty)
+			return true;
+		if (!writeback_die_has_room(b->ssd,
+					    qemu_clock_get_ns(QEMU_CLOCK_REALTIME)))
+			return false;
+		writeback_entry(b, ent);
+		return true;
 	}
 
 	QTAILQ_FOREACH(ent, &set->queue, b_entry) {
 		if (b->dirty_cnt <= b->dirty_lines_low)
-			return;
-		if (ent->dirty)
-			writeback_entry(b, ent);
+			return true;
+		if (!ent->dirty)
+			continue;
+		if (!writeback_die_has_room(b->ssd,
+					    qemu_clock_get_ns(QEMU_CLOCK_REALTIME)))
+			return false;
+		writeback_entry(b, ent);
 	}
+
+	return true;
 }
 
 /* Start above the high watermark, run until below the low one, so the gap
- * between them also caps one pass. Deliberately unthrottled beyond that: a
- * writeback backlog delaying later NAND work is exactly the write cost this is
- * meant to expose. */
+ * between them also caps one pass. Each program additionally waits for room on
+ * the target die -- see writeback_die_has_room(), which is what keeps a pass
+ * from running arbitrarily far ahead of the NAND. */
 void buffer_writeback_bg(struct buffer *b)
 {
-	uint64_t n_set, scanned;
+	uint64_t n_set, scanned, now;
 
-	if (b->size == 0 || b->dirty_cnt <= b->dirty_lines_high)
+	if (b->size == 0 || b->dirty_cnt <= b->dirty_lines_high) {
+		b->writeback_blocked_since = 0;
 		return;
+	}
+
+	now = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+	if (!writeback_die_has_room(b->ssd, now)) {
+		/* Bail out before scanning. This runs from the FTL thread's spin
+		 * loop, so walking a fully-associative set on every blocked call
+		 * would keep the thread from picking up requests. */
+		if (!b->writeback_blocked_since)
+			b->writeback_blocked_since = now;
+		return;
+	}
+	if (b->writeback_blocked_since) {
+		b->ssd->stats.writeback_bg_blocked_ns +=
+			now - b->writeback_blocked_since;
+		b->writeback_blocked_since = 0;
+	}
 
 	n_set = b->set_mask ? b->set_mask : 1;
 	for (scanned = 0; scanned < n_set; scanned++) {
 		if (b->dirty_cnt <= b->dirty_lines_low)
 			break;
-		writeback_set(b, &b->sets[b->writeback_cursor]);
+		/* Leave the cursor put on a die-full stop: the set is unfinished,
+		 * so the next pass should resume on it rather than move on. */
+		if (!writeback_set(b, &b->sets[b->writeback_cursor]))
+			break;
 		b->writeback_cursor = (b->writeback_cursor + 1) % n_set;
 	}
 }
@@ -371,6 +403,7 @@ void buffer_clear(struct buffer *buffer)
 	/* Every entry is gone, so nothing is dirty and the scan restarts. */
 	buffer->dirty_cnt = 0;
 	buffer->writeback_cursor = 0;
+	buffer->writeback_blocked_since = 0;
 
     buffer->read_hit_trapped = buffer->read_miss = 0;
     buffer->write_hit_trapped = buffer->write_miss = 0;

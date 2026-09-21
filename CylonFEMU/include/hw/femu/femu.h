@@ -1244,6 +1244,11 @@ typedef struct FemuCtrl {
      * writeback_watermark_low; the gap also bounds how much one pass writes back. */
     uint8_t         writeback_watermark_high;
     uint8_t         writeback_watermark_low;
+    /* NAND programs background writeback may leave outstanding on one die. A die
+     * programs one page at a time, so 1 models a controller that waits for each
+     * program to land; raise it for a small per-die command queue. 0 removes the
+     * limit, letting one writeback pass run arbitrarily far ahead of the NAND. */
+    uint8_t         writeback_die_queue_depth;
     uint8_t         cxl_skip_ftl;
     uint64_t        base_gpa;
     

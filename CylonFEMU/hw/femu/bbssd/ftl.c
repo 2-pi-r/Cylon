@@ -426,6 +426,8 @@ static void ssd_stats_sample(struct ssd *ssd)
         .stall_writeback_ns   = st->stall_writeback_ns,
         .evict_inflight_waits = st->evict_inflight_waits,
         .dirty_cnt            = b->dirty_cnt,
+        .writeback_bg_blocked_ns = st->writeback_bg_blocked_ns,
+        .die_backlog_max_ns  = st->die_backlog_max_ns,
     };
 }
 
@@ -440,6 +442,8 @@ static void ssd_stats_reset(struct ssd *ssd)
     st->r_cache_fill = st->r_gc = 0;
     st->stall_ns = st->stall_cache_fill_ns = st->stall_writeback_ns = 0;
     st->evict_inflight_waits = 0;
+    st->writeback_bg_blocked_ns = st->die_backlog_max_ns = 0;
+    b->writeback_blocked_since = 0;
     memset(st->trim_pages, 0, sizeof(st->trim_pages));
     memset(st->trim_cmds, 0, sizeof(st->trim_cmds));
     st->nr_samples = 0;
@@ -496,6 +500,15 @@ static void ssd_stats_dump(struct ssd *ssd)
             st->evict_inflight_waits,
             b->dirty_cnt, b->size, b->dirty_lines_high, b->dirty_lines_low);
 
+    /* bg_blocked_s says whether the gate bound background writeback at all;
+     * die_queue_ahead_max is the GC burst the gate deliberately ignores, so a
+     * large value there is the first thing to look at if the gate did nothing. */
+    ftl_log("stats writeback_die_queue_depth=%d bg_blocked_ns=%lu bg_blocked_s=%.3f "
+            "die_backlog_max_ns=%lu die_backlog_max_ms=%.3f\n",
+            ssd->writeback_die_queue_depth,
+            st->writeback_bg_blocked_ns, st->writeback_bg_blocked_ns / 1e9,
+            st->die_backlog_max_ns, st->die_backlog_max_ns / 1e6);
+
     /* No hit rate is printed: hits that never trap are not counted, so any ratio
      * built from these would understate the real one by an unknown amount. */
     ftl_log("stats r_hit_trapped=%lu r_miss=%lu w_hit_trapped=%lu w_miss=%lu "
@@ -546,19 +559,21 @@ static void ssd_stats_dump(struct ssd *ssd)
     fprintf(f, "time_ns,w_writeback,w_gc,gc_lines,gc_lines_forced,live_pages,"
                "free_lines,r_hit_trapped,r_miss,w_hit_trapped,w_miss,stall_ns,"
                "w_writeback_fg,r_cache_fill,r_gc,stall_cache_fill_ns,"
-               "stall_writeback_ns,evict_inflight_waits,dirty_cnt\n");
+               "stall_writeback_ns,evict_inflight_waits,dirty_cnt,"
+               "writeback_bg_blocked_ns,die_backlog_max_ns\n");
     for (int i = 0; i < st->nr_samples; i++) {
         struct ssd_stats_sample *s = &st->samples[i];
 
         fprintf(f, "%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,"
-                   "%lu,%lu,%lu,%lu,%lu,%lu,%lu\n",
+                   "%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu\n",
                 s->time_ns, s->w_writeback, s->w_gc, s->gc_lines,
                 s->gc_lines_forced, s->live_pages, s->free_lines,
                 s->r_hit_trapped, s->r_miss, s->w_hit_trapped, s->w_miss,
                 s->stall_ns,
                 s->w_writeback_fg, s->r_cache_fill, s->r_gc,
                 s->stall_cache_fill_ns, s->stall_writeback_ns,
-                s->evict_inflight_waits, s->dirty_cnt);
+                s->evict_inflight_waits, s->dirty_cnt,
+                s->writeback_bg_blocked_ns, s->die_backlog_max_ns);
     }
     fclose(f);
 
@@ -597,6 +612,7 @@ static void buffer_init(struct ssd *ssd)
      * that would make the hysteresis meaningless. */
     buffer->dirty_cnt = 0;
     buffer->writeback_cursor = 0;
+    buffer->writeback_blocked_since = 0;
     buffer->dirty_lines_high = buffer->size * ssd->writeback_watermark_high / 100;
     buffer->dirty_lines_low = buffer->size * ssd->writeback_watermark_low / 100;
     if (buffer->dirty_lines_low >= buffer->dirty_lines_high)
@@ -675,6 +691,7 @@ void ssd_init(FemuCtrl *n)
     ssd->buffer_way = n->buffer_way;
     ssd->writeback_watermark_high = n->writeback_watermark_high;
     ssd->writeback_watermark_low = n->writeback_watermark_low;
+    ssd->writeback_die_queue_depth = n->writeback_die_queue_depth;
 
     ftl_assert(ssd);
 
@@ -1576,8 +1593,42 @@ static void *ftl_thread(void *arg)
     return NULL;
 }
 
+/* Cap on how far background writeback may run ahead of the NAND: without one, a
+ * single pass programs the whole watermark gap and an eviction then never meets
+ * a dirty or in-flight line, which is why the foreground path never fired. GC is
+ * left out of the backlog because do_gc() copies a line in one burst where a
+ * real controller interleaves it; counting it would shut the gate that long. */
+bool writeback_die_has_room(struct ssd *ssd, uint64_t now)
+{
+    struct ppa ppa = get_new_page(ssd);   /* write pointer, no side effect */
+    struct nand_lun *lun = get_lun(ssd, &ppa);
+    uint64_t gc_done, backlog_after_gc;
 
- /*
+    if (lun->next_lun_avail_time > now) {
+        uint64_t backlog = lun->next_lun_avail_time - now;
+
+        if (backlog > ssd->stats.die_backlog_max_ns)
+            ssd->stats.die_backlog_max_ns = backlog;
+    }
+
+    /* pg_wr_lat is 0 while delay emulation is off; the gate would then never
+     * open, so treat it as no limit. */
+    if (ssd->writeback_die_queue_depth == 0 || ssd->sp.pg_wr_lat == 0)
+        return true;
+
+    /* Skipping GC changes only the decision to issue: the program still queues
+     * behind that work, so GC's cost on the die is unchanged. */
+    gc_done = (lun->gc_endtime > now) ? lun->gc_endtime : now;
+    if (lun->next_lun_avail_time <= gc_done)
+        return true;
+
+    backlog_after_gc = lun->next_lun_avail_time - gc_done;
+
+    return backlog_after_gc <
+           (uint64_t)ssd->writeback_die_queue_depth * ssd->sp.pg_wr_lat;
+}
+
+/*
  * Program one dirty page to NAND.
  * Overwriting here is the only way a PPA gets invalidated in Cylon,
  * so this is the only source of GC victim lines (raises line->ipc).

@@ -19,6 +19,12 @@ enum {
  * a request or record it as a completion time. */
 uint64_t flush_pg(struct ssd* ssd, lpn_t lpn, int src);
 
+/* May background writeback issue one more program to the die the next write
+ * would land on? Also samples stats.die_backlog_max_ns, so call it only
+ * where background writeback actually wants to issue. `now` is the caller's
+ * QEMU_CLOCK_REALTIME reading, passed in so one pass reads the clock once. */
+bool writeback_die_has_room(struct ssd *ssd, uint64_t now);
+
 extern bool ioctl_flag;
 
 
@@ -122,6 +128,10 @@ struct buffer {
     uint64_t dirty_lines_high;
     uint64_t dirty_lines_low;
     uint64_t writeback_cursor;  /* set to resume the background scan from */
+    /* When the die-availability gate first refused, 0 while it is not refusing.
+     * Collapses the many refusals one spin loop produces into a single time
+     * span for stats.writeback_bg_blocked_ns. */
+    uint64_t writeback_blocked_since;
 
 	GTree *tree;
     GTree *ghost_tree;
