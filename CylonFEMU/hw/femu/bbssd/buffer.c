@@ -172,7 +172,8 @@ uint64_t buffer_insert_entry(struct buffer *b, struct buffer_entry *bentry, int 
 
 	// return false;
 	// printf("[FEMU CXL] Insert entry: lpn: %lx\n", bentry->lpn);
-	b->ops.insert_entry(b, bentry, &wait);
+	if (b->ops.insert_entry(b, bentry, &wait) > 0)
+		b->insert_cnt++;
 
 	/* prefetch */
 	/* TODO: prefetch not considered. */
@@ -188,7 +189,8 @@ uint64_t buffer_insert_entry(struct buffer *b, struct buffer_entry *bentry, int 
 			if (!pbentry) {
 				pbentry = buffer_entry_init(b, lpn);
 			}
-			b->ops.insert_entry(b, pbentry, &prefetch_wait);
+			if (b->ops.insert_entry(b, pbentry, &prefetch_wait) > 0)
+				b->insert_cnt++;
 		}
 		(void)prefetch_wait;
 		// printf(">>> Done\n");
@@ -199,8 +201,10 @@ uint64_t buffer_insert_entry(struct buffer *b, struct buffer_entry *bentry, int 
 
 
 /*
- * dirty_cnt has to follow every change to entry->dirty, so route them all
- * through here rather than assigning the flag directly.
+ * dirty_cnt and dirty_list have to follow every change to entry->dirty, so
+ * route them all through here rather than assigning the flag directly. A line
+ * dirtied again goes to the tail with a fresh insert_cnt_when_dirtied, as
+ * the kernel's redirty_tail() restamps dirtied_when.
  */
 void buffer_mark_dirty(struct buffer *b, struct buffer_entry *ent, bool dirty)
 {
@@ -208,9 +212,15 @@ void buffer_mark_dirty(struct buffer *b, struct buffer_entry *ent, bool dirty)
 		return;
 
 	ent->dirty = dirty;
-	if (dirty)
+	if (dirty) {
 		b->dirty_cnt++;
-	else if (b->dirty_cnt)
+		ent->insert_cnt_when_dirtied = b->insert_cnt;
+		QTAILQ_INSERT_TAIL(&b->dirty_list, ent, dirty_list_entry);
+		return;
+	}
+
+	QTAILQ_REMOVE(&b->dirty_list, ent, dirty_list_entry);
+	if (b->dirty_cnt)
 		b->dirty_cnt--;
 }
 
@@ -248,58 +258,39 @@ static void writeback_entry(struct buffer *b, struct buffer_entry *ent)
 	ent->writeback_endtime = qemu_clock_get_ns(QEMU_CLOCK_REALTIME) + lat;
 }
 
-/* Scan in the order the eviction policy consumes the set, oldest first, so what
- * is cleaned is what is about to be evicted and an in-flight line a foreground
- * eviction meets has the least time left. Returns false when the die filled up;
- * the caller then stops the whole pass, since flush_pg() always programs at the
- * current write pointer and another set would meet the same die. */
-static bool writeback_set(struct buffer *b, struct set *set)
+/* Age = lines inserted since the line turned dirty. The kernel's kupdate test
+ * (dirtied_when older than dirty_expire_interval), counted in insertions. */
+static bool is_dirty_line_too_old(struct buffer *b, struct buffer_entry *ent)
 {
-	struct buffer_entry *ent;
-
-	if (b->way == WAY_1) {
-		ent = set->entry;
-		if (!ent || !ent->dirty)
-			return true;
-		if (!writeback_die_has_room(b->ssd,
-					    qemu_clock_get_ns(QEMU_CLOCK_REALTIME)))
-			return false;
-		writeback_entry(b, ent);
-		return true;
-	}
-
-	QTAILQ_FOREACH(ent, &set->queue, b_entry) {
-		if (b->dirty_cnt <= b->dirty_lines_low)
-			return true;
-		if (!ent->dirty)
-			continue;
-		if (!writeback_die_has_room(b->ssd,
-					    qemu_clock_get_ns(QEMU_CLOCK_REALTIME)))
-			return false;
-		writeback_entry(b, ent);
-	}
-
-	return true;
+	return b->age_limit &&
+	       b->insert_cnt - ent->insert_cnt_when_dirtied >= b->age_limit;
 }
 
-/* Start above the high watermark, run until below the low one, so the gap
- * between them also caps one pass. Each program additionally waits for room on
- * the target die -- see writeback_die_has_room(), which is what keeps a pass
- * from running arbitrarily far ahead of the NAND. */
+/* Two triggers, as in the kernel flusher: by watermark, start above high and
+ * run until below low; by age, write every line that reached age_limit,
+ * stopping at the first that has not, as move_expired_inodes() does.
+ * Both take the oldest dirty line first, and each program waits for room on
+ * its die -- see writeback_die_has_room(). */
 void buffer_writeback_bg(struct buffer *b)
 {
-	uint64_t n_set, scanned, now;
+	struct buffer_entry *ent;
+	uint64_t now;
+	bool over_high_watermark;
 
-	if (b->size == 0 || b->dirty_cnt <= b->dirty_lines_high) {
+	if (b->size == 0)
+		return;
+
+	ent = QTAILQ_FIRST(&b->dirty_list);
+	over_high_watermark = b->dirty_cnt > b->dirty_lines_high;
+	if (!ent || (!over_high_watermark && !is_dirty_line_too_old(b, ent))) {
 		b->writeback_blocked_since = 0;
 		return;
 	}
 
 	now = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
 	if (!writeback_die_has_room(b->ssd, now)) {
-		/* Bail out before scanning. This runs from the FTL thread's spin
-		 * loop, so walking a fully-associative set on every blocked call
-		 * would keep the thread from picking up requests. */
+		/* Something is due but the die is full: time the refusal once per
+		 * blocked span, see stats.writeback_bg_blocked_ns. */
 		if (!b->writeback_blocked_since)
 			b->writeback_blocked_since = now;
 		return;
@@ -310,15 +301,18 @@ void buffer_writeback_bg(struct buffer *b)
 		b->writeback_blocked_since = 0;
 	}
 
-	n_set = b->set_mask ? b->set_mask : 1;
-	for (scanned = 0; scanned < n_set; scanned++) {
-		if (b->dirty_cnt <= b->dirty_lines_low)
+	while ((ent = QTAILQ_FIRST(&b->dirty_list))) {
+		bool by_watermark = over_high_watermark &&
+				    b->dirty_cnt > b->dirty_lines_low;
+
+		if (!by_watermark && !is_dirty_line_too_old(b, ent))
 			break;
-		/* Leave the cursor put on a die-full stop: the set is unfinished,
-		 * so the next pass should resume on it rather than move on. */
-		if (!writeback_set(b, &b->sets[b->writeback_cursor]))
+		if (!writeback_die_has_room(b->ssd,
+					    qemu_clock_get_ns(QEMU_CLOCK_REALTIME)))
 			break;
-		b->writeback_cursor = (b->writeback_cursor + 1) % n_set;
+		if (!by_watermark)
+			b->ssd->stats.w_writeback_bg_by_age++;
+		writeback_entry(b, ent);
 	}
 }
 
@@ -400,9 +394,10 @@ void buffer_clear(struct buffer *buffer)
 	buffer->tree = g_tree_new(comp_buffer);
 	// b->bitmap = bitmap_new(b->size);
 
-	/* Every entry is gone, so nothing is dirty and the scan restarts. */
+	/* Every entry is gone, so nothing is dirty. The entries were freed without
+	 * buffer_mark_dirty(), so the list is emptied here rather than unlinked. */
 	buffer->dirty_cnt = 0;
-	buffer->writeback_cursor = 0;
+	QTAILQ_INIT(&buffer->dirty_list);
 	buffer->writeback_blocked_since = 0;
 
     buffer->load_hit_trapped = buffer->load_miss = 0;

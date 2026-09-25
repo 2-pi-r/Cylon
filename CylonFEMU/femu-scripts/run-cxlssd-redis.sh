@@ -30,6 +30,7 @@ prf_dg=0 # Next-n Prefetch degree
 way=5    # Associativity [0:1-way(direct-mapped) 1:2-way 2:4-way 3:8-way 4:16-way 5:fully-associative]
 writeback_watermark_high=10 # when to start
 writeback_watermark_low=5 # when to stop
+writeback_die_queue_depth=64
 
 # Configurable SSD Controller layout parameters (must be power of 2)
 ssd_size=$1		# in MegaBytes
@@ -71,11 +72,11 @@ if [ $ssd_size -eq 40960 ]
 then
     secsz=512
     secs_per_pg=8
-    pgs_per_blk=1024 #256
+    pgs_per_blk=4096 #1024 #256
     blks_per_pl=819     # OP (blks_per_pl > ssd_size)
     pls_per_lun=1
     luns_per_ch=2 #8
-    nchs=8
+    nchs=2 #8
 fi
 
 # 64GB (raw ~82GB, OP 28%)
@@ -144,6 +145,7 @@ FEMU_OPTIONS=${FEMU_OPTIONS}",multipoller_enabled=1"
 FEMU_OPTIONS=${FEMU_OPTIONS}",buffer_way=${way}"
 FEMU_OPTIONS=${FEMU_OPTIONS}",writeback_watermark_high=${writeback_watermark_high}"
 FEMU_OPTIONS=${FEMU_OPTIONS}",writeback_watermark_low=${writeback_watermark_low}"
+FEMU_OPTIONS=${FEMU_OPTIONS}",writeback_die_queue_depth=${writeback_die_queue_depth}"
 
 echo ${FEMU_OPTIONS}
 

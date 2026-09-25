@@ -41,6 +41,12 @@ struct buffer_entry {
      * though it is no longer dirty. Per-entry counterpart to
      * nand_lun.evict_endtime. */
     uint64_t writeback_endtime;
+    /* buffer->insert_cnt when the line last turned dirty. The gap to the
+     * current insert_cnt is how far it has moved toward the FIFO head; see
+     * is_dirty_line_too_old(). */
+    uint64_t insert_cnt_when_dirtied;
+    /* prev/next pointers chaining this entry into buffer->dirty_list */
+    QTAILQ_ENTRY(buffer_entry) dirty_list_entry;
     union {
         /*struct for CLOCK*/
         struct {
@@ -127,7 +133,20 @@ struct buffer {
     uint64_t dirty_cnt;
     uint64_t dirty_lines_high;
     uint64_t dirty_lines_low;
-    uint64_t writeback_cursor;  /* set to resume the background scan from */
+    /* Dirty entries, oldest dirtied first; background writeback takes from the
+     * head instead of scanning the set queues. Under FIFO this is eviction
+     * order too, since a line turns dirty almost only when it is inserted. */
+    QTAILQ_HEAD(, buffer_entry) dirty_list;
+    /* Lines inserted so far, the clock for a dirty line's age (insert_cnt -
+     * insert_cnt_when_dirtied) that triggers background writeback by age.
+     * Unlike ins_cnt, never reset it: ages are differences across time, and a
+     * reset would make every dirty line look too old at once. */
+    uint64_t insert_cnt;
+    /* Write a dirty line back, whatever the dirty count, once this many lines
+     * were inserted after it; 0 = off. Counted in insertions, not time, because
+     * a FIFO line is pushed out by insertions: the watermarks alone let a line
+     * reach the head dirty whenever writes are too sparse to cross high. */
+    uint64_t age_limit;
     /* When the issue limit first refused, 0 while it is not refusing. Collapses
      * the many refusals one spin loop produces into a single time span for
      * stats.writeback_bg_blocked_ns. */
@@ -209,7 +228,8 @@ void buffer_mark_dirty(struct buffer *b, struct buffer_entry *ent, bool dirty);
  * here, so the dirty/in-flight/clean rule lives in one place. */
 uint64_t buffer_evict_cost(struct buffer *b, struct buffer_entry *victim);
 
-/* Watermark-driven background writeback; see struct buffer's dirty watermarks. */
+/* Background writeback, by dirty count (watermarks) and by age
+ * (age_limit); see struct buffer. */
 void buffer_writeback_bg(struct buffer *b);
 
 

@@ -310,8 +310,13 @@ struct ssd_stats {
      * in-flight state changes anything. */
     uint64_t evict_inflight_waits;
 
-    /* Wall-clock time the issue limit held background writeback off while the
-     * dirty count sat above the high watermark. Time rather than a call count
+    /* Background writebacks only the age limit asked for: the dirty count was
+     * not over the watermarks, so without it these lines would have been left
+     * for the eviction to program in the foreground. */
+    uint64_t w_writeback_bg_by_age;
+
+    /* Wall-clock time the issue limit held background writeback off while it
+     * had lines due (by count or by age). Time rather than a call count
      * because buffer_writeback_bg() runs from the FTL thread's spin loop, so a
      * counter would only measure how fast that loop turns. */
     uint64_t writeback_bg_blocked_ns;
@@ -397,6 +402,9 @@ struct ssd {
     /* Programs background writeback may leave outstanding on one die; 0 = no
      * limit. See writeback_die_has_room(). */
     int writeback_die_queue_depth;
+    /* Dirty-line age limit as a share of cache lines inserted since it turned
+     * dirty; 0 = off. See buffer->age_limit. */
+    int writeback_age_pcent;
 
     struct ppa *maptbl; /* page level mapping table */
     uint64_t *rmap;     /* reverse mapptbl, assume it's stored in OOB */

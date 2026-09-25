@@ -627,6 +627,7 @@ static Property femu_props[] = {
     DEFINE_PROP_UINT8("writeback_watermark_high", FemuCtrl, writeback_watermark_high, 50),
     DEFINE_PROP_UINT8("writeback_watermark_low", FemuCtrl, writeback_watermark_low, 45),
     DEFINE_PROP_UINT8("writeback_die_queue_depth", FemuCtrl, writeback_die_queue_depth, 1),
+    DEFINE_PROP_UINT8("writeback_age_pcent", FemuCtrl, writeback_age_pcent, 0),
     DEFINE_PROP_UINT8("cxl_skip_ftl", FemuCtrl, cxl_skip_ftl, 0),
     // DEFINE_PROP_UINT64("base_gpa", FemuCtrl, base_gpa, 0),
     DEFINE_PROP_UINT32("namespaces", FemuCtrl, num_namespaces, 1),

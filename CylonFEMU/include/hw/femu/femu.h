@@ -1249,6 +1249,11 @@ typedef struct FemuCtrl {
      * program to land; raise it for a small per-die command queue. 0 removes the
      * limit, letting one writeback pass run arbitrarily far ahead of the NAND. */
     uint8_t         writeback_die_queue_depth;
+    /* Write a dirty line back once this percent of the cache's lines has been
+     * inserted after it, even below the high watermark, so it is clean before
+     * FIFO eviction reaches it. The kernel's dirty_expire_centisecs, in lines
+     * rather than time. 0 = off. */
+    uint8_t         writeback_age_pcent;
     uint8_t         cxl_skip_ftl;
     uint64_t        base_gpa;
     

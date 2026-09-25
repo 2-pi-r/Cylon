@@ -442,6 +442,7 @@ static void ssd_stats_reset(struct ssd *ssd)
     st->r_cache_fill = st->r_cache_fill_store = st->r_gc = 0;
     st->stall_ns = st->stall_cache_fill_ns = st->stall_writeback_ns = 0;
     st->evict_inflight_waits = 0;
+    st->w_writeback_bg_by_age = 0;
     st->writeback_bg_blocked_ns = st->die_backlog_max_ns = 0;
     b->writeback_blocked_since = 0;
     memset(st->trim_pages, 0, sizeof(st->trim_pages));
@@ -499,6 +500,13 @@ static void ssd_stats_dump(struct ssd *ssd)
             st->w_writeback[WRITEBACK_SRC_FOREGROUND],
             st->evict_inflight_waits,
             b->dirty_cnt, b->size, b->dirty_lines_high, b->dirty_lines_low);
+
+    /* w_writeback_bg_by_age is part of w_writeback_bg: the share the watermarks
+     * alone would have left to the foreground path. */
+    ftl_log("stats writeback_age_pcent=%d age_limit=%lu "
+            "w_writeback_bg_by_age=%lu\n",
+            ssd->writeback_age_pcent, b->age_limit,
+            st->w_writeback_bg_by_age);
 
     /* bg_blocked_s says whether the issue limit bound background writeback at
      * all; die_backlog_max is the GC burst the limit deliberately ignores, so a
@@ -618,12 +626,14 @@ static void buffer_init(struct ssd *ssd)
      * so a narrow gap means frequent small passes. Guard against a low >= high
      * that would make the hysteresis meaningless. */
     buffer->dirty_cnt = 0;
-    buffer->writeback_cursor = 0;
+    QTAILQ_INIT(&buffer->dirty_list);
+    buffer->insert_cnt = 0;
     buffer->writeback_blocked_since = 0;
     buffer->dirty_lines_high = buffer->size * ssd->writeback_watermark_high / 100;
     buffer->dirty_lines_low = buffer->size * ssd->writeback_watermark_low / 100;
     if (buffer->dirty_lines_low >= buffer->dirty_lines_high)
         buffer->dirty_lines_low = buffer->dirty_lines_high / 2;
+    buffer->age_limit = buffer->size * ssd->writeback_age_pcent / 100;
 
     buffer->policy = spp->policy;
     buffer->degree = spp->degree;
@@ -699,6 +709,7 @@ void ssd_init(FemuCtrl *n)
     ssd->writeback_watermark_high = n->writeback_watermark_high;
     ssd->writeback_watermark_low = n->writeback_watermark_low;
     ssd->writeback_die_queue_depth = n->writeback_die_queue_depth;
+    ssd->writeback_age_pcent = n->writeback_age_pcent;
 
     ftl_assert(ssd);
 
