@@ -30,11 +30,13 @@ prf_dg=0 # Next-n Prefetch degree
 way=5    # Associativity [0:1-way(direct-mapped) 1:2-way 2:4-way 3:8-way 4:16-way 5:fully-associative]
 writeback_watermark_high=10 # when to start
 writeback_watermark_low=5 # when to stop
-writeback_die_queue_depth=64
+writeback_age_pcent=50       # write a dirty line once this % of cache lines was inserted after it (0 = off)
+writeback_die_queue_depth=1  # background writeback programs allowed in flight per die (0 = no limit)
+ept_dirty_scan_batch=0       # LPNs whose EPT dirty bit is checked per idle FTL loop, to catch cache hit writes (0 = off)
 
 # Configurable SSD Controller layout parameters (must be power of 2)
 ssd_size=$1		# in MegaBytes
-bufsz=$((ssd_size/20)) # 20480 # $((ssd_size/20))
+bufsz=$((ssd_size/250)) #1 # 20480 # $((ssd_size/20))
 skip_ftl=0
 
 
@@ -77,6 +79,9 @@ then
     pls_per_lun=1
     luns_per_ch=2 #8
     nchs=2 #8
+		# die 64: pgs_per_blk = 256, luns_per_ch = 8, nchs = 8
+		# die 16: pgs_per_blk = 1024, luns_per_ch = 2, nchs = 8
+		# die  4: pgs_per_blk = 4096, luns_per_ch = 2, nchs = 2
 fi
 
 # 64GB (raw ~82GB, OP 28%)
@@ -102,9 +107,6 @@ then
     luns_per_ch=8
     nchs=8
 fi
-
-
-
 
 
 # Latency in nanoseconds
@@ -148,8 +150,9 @@ FEMU_OPTIONS=${FEMU_OPTIONS}",multipoller_enabled=1"
 FEMU_OPTIONS=${FEMU_OPTIONS}",buffer_way=${way}"
 FEMU_OPTIONS=${FEMU_OPTIONS}",writeback_watermark_high=${writeback_watermark_high}"
 FEMU_OPTIONS=${FEMU_OPTIONS}",writeback_watermark_low=${writeback_watermark_low}"
+FEMU_OPTIONS=${FEMU_OPTIONS}",writeback_age_pcent=${writeback_age_pcent}"
 FEMU_OPTIONS=${FEMU_OPTIONS}",writeback_die_queue_depth=${writeback_die_queue_depth}"
-
+FEMU_OPTIONS=${FEMU_OPTIONS}",ept_dirty_scan_batch=${ept_dirty_scan_batch}"
 
 echo ${FEMU_OPTIONS}
 
@@ -164,6 +167,8 @@ dram_size=16G
 
 sudo x86_64-softmmu/qemu-system-x86_64 \
     -name "FEMU-CXLSSD-VM" \
+-netdev tap,id=net1,ifname=tap0,script=no,downscript=no \
+    -device virtio-net-pci,netdev=net1,mac=52:54:00:12:34:57 \
     -machine type=q35,accel=kvm,nvdimm=on,cxl=on -enable-kvm \
     -cpu host \
     -smp $n_threads \

@@ -39,6 +39,8 @@ struct kvm_memslot_get_linear_spt {
 
 int femu_kvm_spte_set_mmio_flag(uint64_t gfn, uint64_t uaddr);
 int femu_kvm_spte_clear_mmio_flag(uint64_t gfn, uint64_t uaddr);
+bool femu_kvm_spte_is_dirty(lpn_t lpn);
+void femu_kvm_spte_clear_dirty(lpn_t lpn);
 
 int femu_kvm_set_user_memory_region(FemuCtrl *n);
 int femu_kvm_del_user_memory_region(FemuCtrl *n);

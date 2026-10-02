@@ -263,6 +263,7 @@ struct ssd_stats_sample {
     uint64_t dirty_cnt;           /* shows the watermark band being worked */
     uint64_t writeback_bg_blocked_ns;
     uint64_t die_backlog_max_ns;
+    uint64_t ept_dirty_found_by_scan;
 };
 
 struct ssd_stats {
@@ -325,6 +326,13 @@ struct ssd_stats {
      * one synchronous burst, so this is dominated by GC and says how much
      * tighter the limit would get if it stopped excluding GC. */
     uint64_t die_backlog_max_ns;
+
+    /* Clean lines the EPT scan found written by the guest through a cache hit,
+     * which FEMU never sees otherwise, and marked dirty. */
+    uint64_t ept_dirty_found_by_scan;
+    /* Full passes of the EPT scan over all LPNs. Run time / this = how long a
+     * hit write can wait before the scan finds it. */
+    uint64_t ept_dirty_scan_full_sweep_cnt;
 
     /* Mapped LPNs. U = live_pages / tt_pgs, the variable GC copy cost hinges on,
      * and the device-side cross-check for the guest's slow-tier usage. */
@@ -405,6 +413,9 @@ struct ssd {
     /* Dirty-line age limit as a share of cache lines inserted since it turned
      * dirty; 0 = off. See buffer->age_limit. */
     int writeback_age_pcent;
+    /* LPNs whose EPT Dirty flag one idle FTL loop pass checks; 0 = off.
+     * See buffer_scan_ept_dirty(). */
+    uint32_t ept_dirty_scan_batch;
 
     struct ppa *maptbl; /* page level mapping table */
     uint64_t *rmap;     /* reverse mapptbl, assume it's stored in OOB */

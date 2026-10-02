@@ -1254,6 +1254,9 @@ typedef struct FemuCtrl {
      * FIFO eviction reaches it. The kernel's dirty_expire_centisecs, in lines
      * rather than time. 0 = off. */
     uint8_t         writeback_age_pcent;
+    /* LPNs whose EPT Dirty flag the FTL thread checks per idle loop, to catch
+     * guest writes through cache hits, which never trap. 0 = off. */
+    uint32_t        ept_dirty_scan_batch;
     uint8_t         cxl_skip_ftl;
     uint64_t        base_gpa;
     

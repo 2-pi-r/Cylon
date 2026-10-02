@@ -152,6 +152,13 @@ struct buffer {
      * stats.writeback_bg_blocked_ns. */
     uint64_t writeback_blocked_since;
 
+    /* EPT Dirty scan state, see buffer_scan_ept_dirty(). Walks LPNs rather than
+     * cached entries: an LPN cursor is never invalidated by an eviction, and
+     * the SPTE array it reads is contiguous. */
+    uint64_t ept_dirty_scan_next_lpn;  /* LPN the next call starts from */
+    uint64_t ept_dirty_scan_batch;     /* LPNs checked per call; 0 = off */
+    uint64_t ept_dirty_scan_lpn_cnt;   /* LPNs in the memslot, the scan range */
+
 	GTree *tree;
     GTree *ghost_tree;
     unsigned long *bitmap; /* bitmap for allocation */
@@ -231,6 +238,9 @@ uint64_t buffer_evict_cost(struct buffer *b, struct buffer_entry *victim);
 /* Background writeback, by dirty count (watermarks) and by age
  * (age_limit); see struct buffer. */
 void buffer_writeback_bg(struct buffer *b);
+
+/* Mark dirty the cached lines the guest wrote through a cache hit. */
+void buffer_scan_ept_dirty(struct buffer *b);
 
 
 /* Todo: refactor for better modularity */

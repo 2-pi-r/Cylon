@@ -428,6 +428,7 @@ static void ssd_stats_sample(struct ssd *ssd)
         .dirty_cnt            = b->dirty_cnt,
         .writeback_bg_blocked_ns = st->writeback_bg_blocked_ns,
         .die_backlog_max_ns  = st->die_backlog_max_ns,
+        .ept_dirty_found_by_scan = st->ept_dirty_found_by_scan,
     };
 }
 
@@ -444,6 +445,7 @@ static void ssd_stats_reset(struct ssd *ssd)
     st->evict_inflight_waits = 0;
     st->w_writeback_bg_by_age = 0;
     st->writeback_bg_blocked_ns = st->die_backlog_max_ns = 0;
+    st->ept_dirty_found_by_scan = st->ept_dirty_scan_full_sweep_cnt = 0;
     b->writeback_blocked_since = 0;
     memset(st->trim_pages, 0, sizeof(st->trim_pages));
     memset(st->trim_cmds, 0, sizeof(st->trim_cmds));
@@ -517,6 +519,12 @@ static void ssd_stats_dump(struct ssd *ssd)
             st->writeback_bg_blocked_ns, st->writeback_bg_blocked_ns / 1e9,
             st->die_backlog_max_ns, st->die_backlog_max_ns / 1e6);
 
+    /* Run time / full_sweep_cnt is how long a hit write can go unseen. */
+    ftl_log("stats ept_dirty_scan_batch=%u ept_dirty_found_by_scan=%lu "
+            "ept_dirty_scan_full_sweep_cnt=%lu\n",
+            ssd->ept_dirty_scan_batch, st->ept_dirty_found_by_scan,
+            st->ept_dirty_scan_full_sweep_cnt);
+
     /* No hit rate is printed: hits that never trap are not counted, so any ratio
      * built from these would understate the real one by an unknown amount. */
     ftl_log("stats load_hit_trapped=%lu load_miss=%lu store_hit_trapped=%lu store_miss=%lu "
@@ -575,12 +583,12 @@ static void ssd_stats_dump(struct ssd *ssd)
                "free_lines,load_hit_trapped,load_miss,store_hit_trapped,store_miss,stall_ns,"
                "w_writeback_fg,r_cache_fill,r_gc,stall_cache_fill_ns,"
                "stall_writeback_ns,evict_inflight_waits,dirty_cnt,"
-               "writeback_bg_blocked_ns,die_backlog_max_ns\n");
+               "writeback_bg_blocked_ns,die_backlog_max_ns,ept_dirty_found_by_scan\n");
     for (int i = 0; i < st->nr_samples; i++) {
         struct ssd_stats_sample *s = &st->samples[i];
 
         fprintf(f, "%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,"
-                   "%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu\n",
+                   "%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu\n",
                 s->time_ns, s->w_writeback, s->w_gc, s->gc_lines,
                 s->gc_lines_forced, s->live_pages, s->free_lines,
                 s->load_hit_trapped, s->load_miss, s->store_hit_trapped, s->store_miss,
@@ -588,7 +596,8 @@ static void ssd_stats_dump(struct ssd *ssd)
                 s->w_writeback_fg, s->r_cache_fill, s->r_gc,
                 s->stall_cache_fill_ns, s->stall_writeback_ns,
                 s->evict_inflight_waits, s->dirty_cnt,
-                s->writeback_bg_blocked_ns, s->die_backlog_max_ns);
+                s->writeback_bg_blocked_ns, s->die_backlog_max_ns,
+                s->ept_dirty_found_by_scan);
     }
     fclose(f);
 
@@ -634,6 +643,9 @@ static void buffer_init(struct ssd *ssd)
     if (buffer->dirty_lines_low >= buffer->dirty_lines_high)
         buffer->dirty_lines_low = buffer->dirty_lines_high / 2;
     buffer->age_limit = buffer->size * ssd->writeback_age_pcent / 100;
+    buffer->ept_dirty_scan_next_lpn = 0;
+    buffer->ept_dirty_scan_batch = ssd->ept_dirty_scan_batch;
+    buffer->ept_dirty_scan_lpn_cnt = ssd->b->size >> 12;  /* one SPTE per 4KB page */
 
     buffer->policy = spp->policy;
     buffer->degree = spp->degree;
@@ -710,6 +722,7 @@ void ssd_init(FemuCtrl *n)
     ssd->writeback_watermark_low = n->writeback_watermark_low;
     ssd->writeback_die_queue_depth = n->writeback_die_queue_depth;
     ssd->writeback_age_pcent = n->writeback_age_pcent;
+    ssd->ept_dirty_scan_batch = n->ept_dirty_scan_batch;
 
     ftl_assert(ssd);
 
@@ -1401,6 +1414,10 @@ static void *ftl_thread(void *arg)
             /* Clean ahead of the foreground path so most evictions find a reusable line.
              * How lazy this is set to is what decides how often a request ends
              * up waiting on a writeback, which is the effect being measured. */
+            /* Scan only while no request is queued, so it never delays one;
+             * before writeback so the lines it dirties go in the same pass. */
+            if (ssd->cxl_req && !femu_ring_count(ssd->cxl_req))
+                buffer_scan_ept_dirty(buffer);
             buffer_writeback_bg(buffer);
 
             if (ssd->cxl_req && femu_ring_count(ssd->cxl_req)) {

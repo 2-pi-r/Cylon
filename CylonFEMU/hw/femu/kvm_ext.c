@@ -174,10 +174,48 @@ int femu_kvm_spte_set_mmio_flag(uint64_t gfn, lpn_t lpn)
     return 0;
 }
 
+/* EPT Dirty flag, set by hardware on a guest write through a DIRECT SPTE. */
+#define EPT_DIRTY_BIT  (1ULL << 9)
+#define EPT_RWX_MASK   0x7ULL  /* read/write/execute permission bits */
+
+/* Whether the SPTE is DIRECT (cache hit), i.e. R/W/X all set.
+ * The MMIO one has R clear, and there KVM uses bits 3-10 as the MMIO
+ * generation, so bit 9 may be read or cleared only on a DIRECT SPTE. */
+static inline bool spte_is_direct(u64 spte)
+{
+    return (spte & EPT_RWX_MASK) == EPT_RWX_MASK;
+}
+
+/* Whether the guest wrote the cached page since its Dirty flag was last cleared.
+ * Only reads, so unlike clearing it never makes later writes go unrecorded. */
+bool femu_kvm_spte_is_dirty(lpn_t lpn)
+{
+    u64 spte = *dualslot_get_sptep(lpn);
+
+    return spte_is_direct(spte) && (spte & EPT_DIRTY_BIT);
+}
+
+/* Clear the Dirty flag of a cached page; atomic against the hardware setting it.
+ * No TLB flush, as it is costly. Without it, a vCPU whose TLB entry still holds
+ * Dirty=1 does not set the flag in the SPTE again, so its writes go unrecorded
+ * until that entry leaves the TLB. */
+void femu_kvm_spte_clear_dirty(lpn_t lpn)
+{
+    u64 *sptep = dualslot_get_sptep(lpn);
+
+    if (spte_is_direct(*sptep))
+        __atomic_fetch_and(sptep, ~EPT_DIRTY_BIT, __ATOMIC_RELAXED);
+}
+
 int femu_kvm_spte_clear_mmio_flag(uint64_t gfn, lpn_t lpn)
 {
     u64 *sptep = dualslot_get_sptep(lpn);
     u64 prev = *sptep;
+
+    /* Already DIRECT (an entry inserted again while cached): rewriting it
+     * would reset the Dirty flag and drop the guest writes it recorded. */
+    if (spte_is_direct(prev))
+        return 0;
     *sptep = make_direct_spte(lpn);
     // printf("%s, [gfn:0x%lx, lpn:0x%lx] change from 0x%llx to 0x%llx\n", __func__, gfn, lpn, prev, *sptep);
     return 0;

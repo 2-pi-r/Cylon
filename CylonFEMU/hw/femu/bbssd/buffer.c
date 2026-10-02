@@ -233,6 +233,13 @@ uint64_t buffer_evict_cost(struct buffer *b, struct buffer_entry *victim)
 {
 	uint64_t now;
 
+	/* Taking hit writes from the EPT at eviction, left off on purpose: first
+	 * seen here, the line is always programmed in the foreground, while a real
+	 * device sees hit writes as they happen and writes it back in the
+	 * background. buffer_scan_ept_dirty() takes them before eviction instead. */
+	// if (!victim->dirty && femu_kvm_spte_is_dirty(victim->lpn))
+	// 	buffer_mark_dirty(b, victim, true);
+
 	if (victim->dirty) {
 		buffer_mark_dirty(b, victim, false);
 		return flush_pg(b->ssd, victim->lpn, WRITEBACK_SRC_FOREGROUND);
@@ -256,6 +263,10 @@ static void writeback_entry(struct buffer *b, struct buffer_entry *ent)
 
 	buffer_mark_dirty(b, ent, false);
 	ent->writeback_endtime = qemu_clock_get_ns(QEMU_CLOCK_REALTIME) + lat;
+	/* The program just issued holds the hit writes recorded so far; left set,
+	 * the next EPT scan would dirty the line again for nothing. Some later hit
+	 * writes may go unrecorded, see femu_kvm_spte_clear_dirty(). */
+	femu_kvm_spte_clear_dirty(ent->lpn);
 }
 
 /* Age = lines inserted since the line turned dirty. The kernel's kupdate test
@@ -313,6 +324,36 @@ void buffer_writeback_bg(struct buffer *b)
 		if (!by_watermark)
 			b->ssd->stats.w_writeback_bg_by_age++;
 		writeback_entry(b, ent);
+	}
+}
+
+/* Mark dirty the cached lines the guest wrote through a cache hit.
+ * Such writes never trap, so the EPT Dirty flag set by hardware is their only
+ * trace. Checks a batch of LPNs per call so background writeback can take the
+ * lines before eviction. Reads only; writeback_entry() clears the flag. */
+void buffer_scan_ept_dirty(struct buffer *b)
+{
+	struct buffer_entry *ent;
+	lpn_t lpn;
+	uint64_t i;
+
+	if (b->size == 0)
+		return;
+
+	for (i = 0; i < b->ept_dirty_scan_batch; i++) {
+		lpn = b->ept_dirty_scan_next_lpn;
+		if (++b->ept_dirty_scan_next_lpn == b->ept_dirty_scan_lpn_cnt) {
+			b->ept_dirty_scan_next_lpn = 0;
+			b->ssd->stats.ept_dirty_scan_full_sweep_cnt++;
+		}
+
+		if (!femu_kvm_spte_is_dirty(lpn))
+			continue;
+		ent = buffer_lookup_entry(b, lpn);
+		if (ent && !ent->dirty) {
+			buffer_mark_dirty(b, ent, true);
+			b->ssd->stats.ept_dirty_found_by_scan++;
+		}
 	}
 }
 
