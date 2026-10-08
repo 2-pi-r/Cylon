@@ -32,7 +32,7 @@ writeback_watermark_high=10 # when to start
 writeback_watermark_low=5 # when to stop
 writeback_age_pcent=50       # write a dirty line once this % of cache lines was inserted after it (0 = off)
 writeback_die_queue_depth=1  # background writeback programs allowed in flight per die (0 = no limit)
-ept_dirty_scan_batch=0       # LPNs whose EPT dirty bit is checked per idle FTL loop, to catch cache hit writes (0 = off)
+ept_dirty_scan_batch=512     # LPNs whose EPT dirty bit is checked per idle FTL loop, to catch cache hit writes (0 = off)
 
 # Configurable SSD Controller layout parameters (must be power of 2)
 ssd_size=$1		# in MegaBytes
