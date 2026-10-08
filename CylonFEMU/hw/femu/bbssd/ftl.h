@@ -333,6 +333,17 @@ struct ssd_stats {
     /* Full passes of the EPT scan over all LPNs. Run time / this = how long a
      * hit write can wait before the scan finds it. */
     uint64_t ept_dirty_scan_full_sweep_cnt;
+    /* Time requests waited for an EPT scan batch that was running when they
+     * arrived, summed over requests: the scan's cost to the guest. */
+    uint64_t ept_dirty_scan_delay_ns;
+    /* Of w_writeback[FOREGROUND], victims made dirty by the EPT scan. */
+    uint64_t w_writeback_fg_by_ept_scan;
+    /* Evictions of a line FEMU thought clean but the EPT had dirty: hit writes
+     * the scan had not reached yet, so they were never written back. */
+    uint64_t ept_dirty_missed_at_evict;
+    /* FTL thread time spent keeping dirty_tree sorted, an upper bound on what
+     * the eviction-order writeback costs the guest. */
+    uint64_t dirty_index_ns;
 
     /* Mapped LPNs. U = live_pages / tt_pgs, the variable GC copy cost hinges on,
      * and the device-side cross-check for the guest's slow-tier usage. */
@@ -410,8 +421,8 @@ struct ssd {
     /* Programs background writeback may leave outstanding on one die; 0 = no
      * limit. See writeback_die_has_room(). */
     int writeback_die_queue_depth;
-    /* Dirty-line age limit as a share of cache lines inserted since it turned
-     * dirty; 0 = off. See buffer->age_limit. */
+    /* Dirty-line age limit as a share of cache lines inserted since the line
+     * was; 0 = off. See buffer->age_limit. */
     int writeback_age_pcent;
     /* LPNs whose EPT Dirty flag one idle FTL loop pass checks; 0 = off.
      * See buffer_scan_ept_dirty(). */

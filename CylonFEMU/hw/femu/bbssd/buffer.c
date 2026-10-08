@@ -55,6 +55,7 @@ struct buffer_entry *buffer_entry_init(struct buffer *b, lpn_t lpn)
         
     new->lpn = lpn;
     new->dirty = false;
+    new->dirtied_by_ept_scan = false;
     new->writeback_endtime = 0;
 
 	return new;
@@ -173,7 +174,7 @@ uint64_t buffer_insert_entry(struct buffer *b, struct buffer_entry *bentry, int 
 	// return false;
 	// printf("[FEMU CXL] Insert entry: lpn: %lx\n", bentry->lpn);
 	if (b->ops.insert_entry(b, bentry, &wait) > 0)
-		b->insert_cnt++;
+		bentry->insert_cnt_when_inserted = ++b->insert_cnt;
 
 	/* prefetch */
 	/* TODO: prefetch not considered. */
@@ -190,7 +191,7 @@ uint64_t buffer_insert_entry(struct buffer *b, struct buffer_entry *bentry, int 
 				pbentry = buffer_entry_init(b, lpn);
 			}
 			if (b->ops.insert_entry(b, pbentry, &prefetch_wait) > 0)
-				b->insert_cnt++;
+				pbentry->insert_cnt_when_inserted = ++b->insert_cnt;
 		}
 		(void)prefetch_wait;
 		// printf(">>> Done\n");
@@ -200,28 +201,53 @@ uint64_t buffer_insert_entry(struct buffer *b, struct buffer_entry *bentry, int 
 }
 
 
+int buffer_comp_insert_order(const void *a, const void *b)
+{
+	uint64_t x = ((const struct buffer_entry *)a)->insert_cnt_when_inserted;
+	uint64_t y = ((const struct buffer_entry *)b)->insert_cnt_when_inserted;
+
+	return (x > y) - (x < y);
+}
+
+static gboolean take_first_entry(gpointer key, gpointer value, gpointer first)
+{
+	*(struct buffer_entry **)first = value;
+	return TRUE;	/* stop at the first, the smallest key */
+}
+
 /*
- * dirty_cnt and dirty_list have to follow every change to entry->dirty, so
+ * dirty_cnt and dirty_tree have to follow every change to entry->dirty, so
  * route them all through here rather than assigning the flag directly. A line
- * dirtied again goes to the tail with a fresh insert_cnt_when_dirtied, as
- * the kernel's redirty_tail() restamps dirtied_when.
+ * dirtied again keeps its insert_cnt_when_inserted, so it goes back to its
+ * eviction-order place. The entry must already be inserted: that sets its key.
  */
 void buffer_mark_dirty(struct buffer *b, struct buffer_entry *ent, bool dirty)
 {
+	uint64_t start;
+
 	if (ent->dirty == dirty)
 		return;
 
 	ent->dirty = dirty;
+	start = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
 	if (dirty) {
 		b->dirty_cnt++;
-		ent->insert_cnt_when_dirtied = b->insert_cnt;
-		QTAILQ_INSERT_TAIL(&b->dirty_list, ent, dirty_list_entry);
-		return;
+		g_tree_insert(b->dirty_tree, ent, ent);
+		if (!b->dirty_tree_first ||
+		    buffer_comp_insert_order(ent, b->dirty_tree_first) < 0)
+			b->dirty_tree_first = ent;
+	} else {
+		ent->dirtied_by_ept_scan = false;
+		g_tree_remove(b->dirty_tree, ent);
+		if (b->dirty_tree_first == ent) {
+			b->dirty_tree_first = NULL;
+			g_tree_foreach(b->dirty_tree, take_first_entry,
+				       &b->dirty_tree_first);
+		}
+		if (b->dirty_cnt)
+			b->dirty_cnt--;
 	}
-
-	QTAILQ_REMOVE(&b->dirty_list, ent, dirty_list_entry);
-	if (b->dirty_cnt)
-		b->dirty_cnt--;
+	b->ssd->stats.dirty_index_ns += qemu_clock_get_ns(QEMU_CLOCK_REALTIME) - start;
 }
 
 /* Cost of taking this entry's line, before it is unlinked:
@@ -241,9 +267,16 @@ uint64_t buffer_evict_cost(struct buffer *b, struct buffer_entry *victim)
 	// 	buffer_mark_dirty(b, victim, true);
 
 	if (victim->dirty) {
+		if (victim->dirtied_by_ept_scan)
+			b->ssd->stats.w_writeback_fg_by_ept_scan++;
 		buffer_mark_dirty(b, victim, false);
 		return flush_pg(b->ssd, victim->lpn, WRITEBACK_SRC_FOREGROUND);
 	}
+
+	/* Counted only, for the reason above: hit writes the scan had not reached
+	 * yet, so they are never written back. */
+	if (femu_kvm_spte_is_dirty(victim->lpn))
+		b->ssd->stats.ept_dirty_missed_at_evict++;
 
 	now = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
 	if (victim->writeback_endtime > now) {
@@ -269,19 +302,19 @@ static void writeback_entry(struct buffer *b, struct buffer_entry *ent)
 	femu_kvm_spte_clear_dirty(ent->lpn);
 }
 
-/* Age = lines inserted since the line turned dirty. The kernel's kupdate test
- * (dirtied_when older than dirty_expire_interval), counted in insertions. */
+/* Age = lines inserted since this line was, i.e. how far it has moved toward
+ * eviction under FIFO. */
 static bool is_dirty_line_too_old(struct buffer *b, struct buffer_entry *ent)
 {
 	return b->age_limit &&
-	       b->insert_cnt - ent->insert_cnt_when_dirtied >= b->age_limit;
+	       b->insert_cnt - ent->insert_cnt_when_inserted >= b->age_limit;
 }
 
 /* Two triggers, as in the kernel flusher: by watermark, start above high and
  * run until below low; by age, write every line that reached age_limit,
  * stopping at the first that has not, as move_expired_inodes() does.
- * Both take the oldest dirty line first, and each program waits for room on
- * its die -- see writeback_die_has_room(). */
+ * Both take the dirty line nearest eviction first, and each program waits for
+ * room on its die -- see writeback_die_has_room(). */
 void buffer_writeback_bg(struct buffer *b)
 {
 	struct buffer_entry *ent;
@@ -291,7 +324,7 @@ void buffer_writeback_bg(struct buffer *b)
 	if (b->size == 0)
 		return;
 
-	ent = QTAILQ_FIRST(&b->dirty_list);
+	ent = b->dirty_tree_first;
 	over_high_watermark = b->dirty_cnt > b->dirty_lines_high;
 	if (!ent || (!over_high_watermark && !is_dirty_line_too_old(b, ent))) {
 		b->writeback_blocked_since = 0;
@@ -312,7 +345,7 @@ void buffer_writeback_bg(struct buffer *b)
 		b->writeback_blocked_since = 0;
 	}
 
-	while ((ent = QTAILQ_FIRST(&b->dirty_list))) {
+	while ((ent = b->dirty_tree_first)) {
 		bool by_watermark = over_high_watermark &&
 				    b->dirty_cnt > b->dirty_lines_low;
 
@@ -337,9 +370,10 @@ void buffer_scan_ept_dirty(struct buffer *b)
 	lpn_t lpn;
 	uint64_t i;
 
-	if (b->size == 0)
+	if (b->size == 0 || b->ept_dirty_scan_batch == 0)
 		return;
 
+	b->ept_dirty_scan_last_start_ns = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
 	for (i = 0; i < b->ept_dirty_scan_batch; i++) {
 		lpn = b->ept_dirty_scan_next_lpn;
 		if (++b->ept_dirty_scan_next_lpn == b->ept_dirty_scan_lpn_cnt) {
@@ -352,9 +386,11 @@ void buffer_scan_ept_dirty(struct buffer *b)
 		ent = buffer_lookup_entry(b, lpn);
 		if (ent && !ent->dirty) {
 			buffer_mark_dirty(b, ent, true);
+			ent->dirtied_by_ept_scan = true;
 			b->ssd->stats.ept_dirty_found_by_scan++;
 		}
 	}
+	b->ept_dirty_scan_last_end_ns = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
 }
 
 /*
@@ -436,9 +472,11 @@ void buffer_clear(struct buffer *buffer)
 	// b->bitmap = bitmap_new(b->size);
 
 	/* Every entry is gone, so nothing is dirty. The entries were freed without
-	 * buffer_mark_dirty(), so the list is emptied here rather than unlinked. */
+	 * buffer_mark_dirty(), so the tree is rebuilt here rather than emptied. */
 	buffer->dirty_cnt = 0;
-	QTAILQ_INIT(&buffer->dirty_list);
+	g_tree_destroy(buffer->dirty_tree);
+	buffer->dirty_tree = g_tree_new(buffer_comp_insert_order);
+	buffer->dirty_tree_first = NULL;
 	buffer->writeback_blocked_since = 0;
 
     buffer->load_hit_trapped = buffer->load_miss = 0;

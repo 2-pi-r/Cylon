@@ -1251,8 +1251,7 @@ typedef struct FemuCtrl {
     uint8_t         writeback_die_queue_depth;
     /* Write a dirty line back once this percent of the cache's lines has been
      * inserted after it, even below the high watermark, so it is clean before
-     * FIFO eviction reaches it. The kernel's dirty_expire_centisecs, in lines
-     * rather than time. 0 = off. */
+     * FIFO eviction reaches it. 0 = off. */
     uint8_t         writeback_age_pcent;
     /* LPNs whose EPT Dirty flag the FTL thread checks per idle loop, to catch
      * guest writes through cache hits, which never trap. 0 = off. */

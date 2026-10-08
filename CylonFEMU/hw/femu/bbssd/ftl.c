@@ -446,6 +446,8 @@ static void ssd_stats_reset(struct ssd *ssd)
     st->w_writeback_bg_by_age = 0;
     st->writeback_bg_blocked_ns = st->die_backlog_max_ns = 0;
     st->ept_dirty_found_by_scan = st->ept_dirty_scan_full_sweep_cnt = 0;
+    st->ept_dirty_scan_delay_ns = st->ept_dirty_missed_at_evict = 0;
+    st->w_writeback_fg_by_ept_scan = st->dirty_index_ns = 0;
     b->writeback_blocked_since = 0;
     memset(st->trim_pages, 0, sizeof(st->trim_pages));
     memset(st->trim_cmds, 0, sizeof(st->trim_cmds));
@@ -521,9 +523,17 @@ static void ssd_stats_dump(struct ssd *ssd)
 
     /* Run time / full_sweep_cnt is how long a hit write can go unseen. */
     ftl_log("stats ept_dirty_scan_batch=%u ept_dirty_found_by_scan=%lu "
-            "ept_dirty_scan_full_sweep_cnt=%lu\n",
+            "ept_dirty_scan_full_sweep_cnt=%lu ept_dirty_scan_delay_ns=%lu "
+            "ept_dirty_scan_delay_s=%.3f ept_dirty_missed_at_evict=%lu "
+            "w_writeback_fg_by_ept_scan=%lu\n",
             ssd->ept_dirty_scan_batch, st->ept_dirty_found_by_scan,
-            st->ept_dirty_scan_full_sweep_cnt);
+            st->ept_dirty_scan_full_sweep_cnt, st->ept_dirty_scan_delay_ns,
+            st->ept_dirty_scan_delay_ns / 1e9, st->ept_dirty_missed_at_evict,
+            st->w_writeback_fg_by_ept_scan);
+
+    /* Upper bound on the eviction-order writeback's cost to the guest. */
+    ftl_log("stats dirty_index_ns=%lu dirty_index_s=%.3f\n",
+            st->dirty_index_ns, st->dirty_index_ns / 1e9);
 
     /* No hit rate is printed: hits that never trap are not counted, so any ratio
      * built from these would understate the real one by an unknown amount. */
@@ -635,7 +645,8 @@ static void buffer_init(struct ssd *ssd)
      * so a narrow gap means frequent small passes. Guard against a low >= high
      * that would make the hysteresis meaningless. */
     buffer->dirty_cnt = 0;
-    QTAILQ_INIT(&buffer->dirty_list);
+    buffer->dirty_tree = g_tree_new(buffer_comp_insert_order);
+    buffer->dirty_tree_first = NULL;
     buffer->insert_cnt = 0;
     buffer->writeback_blocked_since = 0;
     buffer->dirty_lines_high = buffer->size * ssd->writeback_watermark_high / 100;
@@ -646,6 +657,7 @@ static void buffer_init(struct ssd *ssd)
     buffer->ept_dirty_scan_next_lpn = 0;
     buffer->ept_dirty_scan_batch = ssd->ept_dirty_scan_batch;
     buffer->ept_dirty_scan_lpn_cnt = ssd->b->size >> 12;  /* one SPTE per 4KB page */
+    buffer->ept_dirty_scan_last_start_ns = buffer->ept_dirty_scan_last_end_ns = 0;
 
     buffer->policy = spp->policy;
     buffer->degree = spp->degree;
@@ -1414,8 +1426,9 @@ static void *ftl_thread(void *arg)
             /* Clean ahead of the foreground path so most evictions find a reusable line.
              * How lazy this is set to is what decides how often a request ends
              * up waiting on a writeback, which is the effect being measured. */
-            /* Scan only while no request is queued, so it never delays one;
-             * before writeback so the lines it dirties go in the same pass. */
+            /* Scan only while no request is queued, so only a request arriving
+             * mid-batch waits (stats.ept_dirty_scan_delay_ns); before writeback
+             * so the lines it dirties go in the same pass. */
             if (ssd->cxl_req && !femu_ring_count(ssd->cxl_req))
                 buffer_scan_ept_dirty(buffer);
             buffer_writeback_bg(buffer);
@@ -1432,6 +1445,14 @@ static void *ftl_thread(void *arg)
                     printf("FEMU: FTL cxl_req dequeue failed\n");
                 }
                 assert(creq != NULL);
+
+                /* Arrived while the last EPT scan batch ran, so it waited until
+                 * the batch ended. TRIM has stime 0 and never matches. */
+                uint64_t arrival_ns = (uint64_t)creq->ncmd->stime;
+                if (arrival_ns >= buffer->ept_dirty_scan_last_start_ns &&
+                    arrival_ns < buffer->ept_dirty_scan_last_end_ns)
+                    ssd->stats.ept_dirty_scan_delay_ns +=
+                        buffer->ept_dirty_scan_last_end_ns - arrival_ns;
 
                 /* Must work regardless of LSA_TROLL, so this lives outside the switch below */
                 if (creq->ncmd->cmd == CXL_TRIM) {
@@ -1512,7 +1533,6 @@ static void *ftl_thread(void *arg)
                 }
                 else {//buffer miss: fetch from NAND
                     bentry = buffer_entry_init(buffer, lpn);
-                    buffer_mark_dirty(buffer, bentry, read?false:true);
 
                     if (read)   buffer->load_miss++;
                     else        buffer->store_miss++;
@@ -1524,6 +1544,8 @@ static void *ftl_thread(void *arg)
                      * there is nothing left to charge the wait to. */
                     writeback_wait = buffer_insert_entry(buffer, bentry,
                                                          INSERT_PREFETCH);
+                    /* After the insert, which gives the line its dirty_tree key. */
+                    buffer_mark_dirty(buffer, bentry, read?false:true);
 
                     ppa = get_maptbl_ent(ssd, lpn);
                     if (mapped_ppa(&ppa) && valid_ppa(ssd, &ppa)) {

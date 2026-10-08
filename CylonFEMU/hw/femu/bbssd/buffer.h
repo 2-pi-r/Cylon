@@ -41,12 +41,14 @@ struct buffer_entry {
      * though it is no longer dirty. Per-entry counterpart to
      * nand_lun.evict_endtime. */
     uint64_t writeback_endtime;
-    /* buffer->insert_cnt when the line last turned dirty. The gap to the
-     * current insert_cnt is how far it has moved toward the FIFO head; see
-     * is_dirty_line_too_old(). */
-    uint64_t insert_cnt_when_dirtied;
-    /* prev/next pointers chaining this entry into buffer->dirty_list */
-    QTAILQ_ENTRY(buffer_entry) dirty_list_entry;
+    /* buffer->insert_cnt when the line was inserted. Its key in
+     * buffer->dirty_tree; the gap to the current insert_cnt is how far it has
+     * moved toward the FIFO head, see is_dirty_line_too_old(). Must not change
+     * while the line is dirty, or the tree loses its order. */
+    uint64_t insert_cnt_when_inserted;
+    /* Dirty because buffer_scan_ept_dirty() found a hit write, not because a
+     * store trapped; cleared when the line turns clean. */
+    bool dirtied_by_ept_scan;
     union {
         /*struct for CLOCK*/
         struct {
@@ -133,12 +135,16 @@ struct buffer {
     uint64_t dirty_cnt;
     uint64_t dirty_lines_high;
     uint64_t dirty_lines_low;
-    /* Dirty entries, oldest dirtied first; background writeback takes from the
-     * head instead of scanning the set queues. Under FIFO this is eviction
-     * order too, since a line turns dirty almost only when it is inserted. */
-    QTAILQ_HEAD(, buffer_entry) dirty_list;
+    /* Dirty entries in insertion order, which is eviction order under FIFO
+     * (not under the other policies): background writeback takes the line
+     * nearest eviction first instead of scanning the set queues. A tree, not a
+     * list, because a line found dirty by the EPT scan goes to the middle. */
+    GTree *dirty_tree;
+    /* First entry of dirty_tree, NULL if none. Kept up to date on insert and
+     * remove so the FTL loop, which checks it every turn, reads it in O(1). */
+    struct buffer_entry *dirty_tree_first;
     /* Lines inserted so far, the clock for a dirty line's age (insert_cnt -
-     * insert_cnt_when_dirtied) that triggers background writeback by age.
+     * insert_cnt_when_inserted) that triggers background writeback by age.
      * Unlike ins_cnt, never reset it: ages are differences across time, and a
      * reset would make every dirty line look too old at once. */
     uint64_t insert_cnt;
@@ -158,6 +164,10 @@ struct buffer {
     uint64_t ept_dirty_scan_next_lpn;  /* LPN the next call starts from */
     uint64_t ept_dirty_scan_batch;     /* LPNs checked per call; 0 = off */
     uint64_t ept_dirty_scan_lpn_cnt;   /* LPNs in the memslot, the scan range */
+    /* Time span of the last scan batch. A request that arrived inside it
+     * waited until its end; see stats.ept_dirty_scan_delay_ns. */
+    uint64_t ept_dirty_scan_last_start_ns;
+    uint64_t ept_dirty_scan_last_end_ns;
 
 	GTree *tree;
     GTree *ghost_tree;
@@ -230,6 +240,9 @@ void buffer_destroy_set(struct buffer *);
 
 /* Keep entry->dirty and buffer->dirty_cnt in step. */
 void buffer_mark_dirty(struct buffer *b, struct buffer_entry *ent, bool dirty);
+
+/* dirty_tree order: insert_cnt_when_inserted. */
+int buffer_comp_insert_order(const void *a, const void *b);
 
 /* Cost of taking this entry's line. Every policy's evict_victim() goes through
  * here, so the dirty/in-flight/clean rule lives in one place. */
