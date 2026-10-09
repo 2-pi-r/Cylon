@@ -266,6 +266,21 @@ struct ssd_stats_sample {
     uint64_t ept_dirty_found_by_scan;
 };
 
+/* Indexes of stats.ept_dirty_found_by_clean_duration. */
+enum {
+    CLEAN_SINCE_INSERT = 0,     /* clean since the line was inserted */
+    CLEAN_SINCE_WRITEBACK = 1,  /* clean since a background writeback */
+    CLEAN_SINCE_NR,
+};
+enum {
+    CLEAN_DURATION_10MS = 0,    /* < 10 ms */
+    CLEAN_DURATION_100MS,       /* < 100 ms */
+    CLEAN_DURATION_1S,          /* < 1 s */
+    CLEAN_DURATION_10S,         /* < 10 s */
+    CLEAN_DURATION_LONGER,      /* >= 10 s */
+    CLEAN_DURATION_NR,
+};
+
 struct ssd_stats {
     /* NAND page programs by trigger. w_first_touch is the allocation done on the
      * first access to an unmapped LPN, so even a read programs a page; it should
@@ -335,7 +350,7 @@ struct ssd_stats {
     uint64_t ept_dirty_scan_full_sweep_cnt;
     /* Time requests waited for an EPT scan batch that was running when they
      * arrived, summed over requests: the scan's cost to the guest. */
-    uint64_t ept_dirty_scan_delay_ns;
+    uint64_t stall_ept_dirty_scan_ns;
     /* Of w_writeback[FOREGROUND], victims made dirty by the EPT scan. */
     uint64_t w_writeback_fg_by_ept_scan;
     /* Evictions of a line FEMU thought clean but the EPT had dirty: hit writes
@@ -344,6 +359,15 @@ struct ssd_stats {
     /* FTL thread time spent keeping dirty_tree sorted, an upper bound on what
      * the eviction-order writeback costs the guest. */
     uint64_t dirty_index_ns;
+
+    /* How long a line had been clean when the EPT scan found a hit write on
+     * it, by what made it clean (CLEAN_SINCE_*) and by duration bucket
+     * (CLEAN_DURATION_*). Separates a store that follows the fill closely
+     * from one that follows a background writeback. */
+    uint64_t ept_dirty_found_by_clean_duration[CLEAN_SINCE_NR][CLEAN_DURATION_NR];
+    /* Hit writes the EPT scan found per LPN, saturating. Tells whether a few
+     * slow-tier resident pages are written again and again. */
+    uint16_t *ept_dirty_found_cnt;
 
     /* Mapped LPNs. U = live_pages / tt_pgs, the variable GC copy cost hinges on,
      * and the device-side cross-check for the guest's slow-tier usage. */

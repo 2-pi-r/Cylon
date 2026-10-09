@@ -381,6 +381,7 @@ static void ssd_init_stats(struct ssd *ssd)
     struct ssd_stats *st = &ssd->stats;
 
     st->gc_copy_cnt = g_malloc0(sizeof(uint16_t) * ssd->sp.tt_pgs);
+    st->ept_dirty_found_cnt = g_malloc0(sizeof(uint16_t) * ssd->sp.tt_pgs);
     st->samples = g_malloc0(sizeof(struct ssd_stats_sample) *
                             SSD_STATS_SAMPLE_MAX);
 }
@@ -446,7 +447,7 @@ static void ssd_stats_reset(struct ssd *ssd)
     st->w_writeback_bg_by_age = 0;
     st->writeback_bg_blocked_ns = st->die_backlog_max_ns = 0;
     st->ept_dirty_found_by_scan = st->ept_dirty_scan_full_sweep_cnt = 0;
-    st->ept_dirty_scan_delay_ns = st->ept_dirty_missed_at_evict = 0;
+    st->stall_ept_dirty_scan_ns = st->ept_dirty_missed_at_evict = 0;
     st->w_writeback_fg_by_ept_scan = st->dirty_index_ns = 0;
     b->writeback_blocked_since = 0;
     memset(st->trim_pages, 0, sizeof(st->trim_pages));
@@ -455,6 +456,9 @@ static void ssd_stats_reset(struct ssd *ssd)
     st->next_sample_w_writeback = 0;
     st->next_sample_reqs = 0;
     memset(st->gc_copy_cnt, 0, sizeof(uint16_t) * ssd->sp.tt_pgs);
+    memset(st->ept_dirty_found_by_clean_duration, 0,
+           sizeof(st->ept_dirty_found_by_clean_duration));
+    memset(st->ept_dirty_found_cnt, 0, sizeof(uint16_t) * ssd->sp.tt_pgs);
 
     /* The buffer owns its hit/miss counters; zero them here so every counter
      * covers the same window. Cache contents are left alone -- this resets the
@@ -467,7 +471,8 @@ static void ssd_stats_reset(struct ssd *ssd)
 
 /*
  * Time series to <base>.csv, per-LPN GC copy counts to <base>.gc_copy_cnt.bin
- * (raw uint16 array indexed by LPN). Base path defaults to /tmp/cylon_ssd_stats,
+ * and per-LPN found hit writes to <base>.ept_dirty_found_cnt.bin (raw uint16
+ * arrays indexed by LPN). Base path defaults to /tmp/cylon_ssd_stats,
  * override with $CYLON_STATS_PATH. The guest issues this at the end of a
  * measurement window, so the file I/O here perturbs nothing that is measured.
  */
@@ -523,13 +528,27 @@ static void ssd_stats_dump(struct ssd *ssd)
 
     /* Run time / full_sweep_cnt is how long a hit write can go unseen. */
     ftl_log("stats ept_dirty_scan_batch=%u ept_dirty_found_by_scan=%lu "
-            "ept_dirty_scan_full_sweep_cnt=%lu ept_dirty_scan_delay_ns=%lu "
-            "ept_dirty_scan_delay_s=%.3f ept_dirty_missed_at_evict=%lu "
+            "ept_dirty_scan_full_sweep_cnt=%lu stall_ept_dirty_scan_ns=%lu "
+            "stall_ept_dirty_scan_s=%.3f ept_dirty_missed_at_evict=%lu "
             "w_writeback_fg_by_ept_scan=%lu\n",
             ssd->ept_dirty_scan_batch, st->ept_dirty_found_by_scan,
-            st->ept_dirty_scan_full_sweep_cnt, st->ept_dirty_scan_delay_ns,
-            st->ept_dirty_scan_delay_ns / 1e9, st->ept_dirty_missed_at_evict,
+            st->ept_dirty_scan_full_sweep_cnt, st->stall_ept_dirty_scan_ns,
+            st->stall_ept_dirty_scan_ns / 1e9, st->ept_dirty_missed_at_evict,
             st->w_writeback_fg_by_ept_scan);
+
+    /* A store that follows the fill closely shows up under clean_since_insert
+     * in the short buckets; one that follows a background writeback, under
+     * clean_since_writeback. */
+    for (int since = 0; since < CLEAN_SINCE_NR; since++) {
+        const uint64_t *d = st->ept_dirty_found_by_clean_duration[since];
+
+        ftl_log("stats ept_dirty_found clean_since_%s <10ms=%lu <100ms=%lu "
+                "<1s=%lu <10s=%lu >=10s=%lu\n",
+                since == CLEAN_SINCE_INSERT ? "insert" : "writeback",
+                d[CLEAN_DURATION_10MS], d[CLEAN_DURATION_100MS],
+                d[CLEAN_DURATION_1S], d[CLEAN_DURATION_10S],
+                d[CLEAN_DURATION_LONGER]);
+    }
 
     /* Upper bound on the eviction-order writeback's cost to the guest. */
     ftl_log("stats dirty_index_ns=%lu dirty_index_s=%.3f\n",
@@ -620,8 +639,18 @@ static void ssd_stats_dump(struct ssd *ssd)
     fwrite(st->gc_copy_cnt, sizeof(uint16_t), ssd->sp.tt_pgs, f);
     fclose(f);
 
-    ftl_log("stats dumped to %s.csv / %s.gc_copy_cnt.bin (%d samples)\n",
-            base, base, st->nr_samples);
+    snprintf(path, sizeof(path), "%s.ept_dirty_found_cnt.bin", base);
+    f = fopen(path, "w");
+    if (!f) {
+        ftl_err("stats dump: cannot open %s\n", path);
+        return;
+    }
+    fwrite(st->ept_dirty_found_cnt, sizeof(uint16_t), ssd->sp.tt_pgs, f);
+    fclose(f);
+
+    ftl_log("stats dumped to %s.csv / %s.gc_copy_cnt.bin / "
+            "%s.ept_dirty_found_cnt.bin (%d samples)\n",
+            base, base, base, st->nr_samples);
 }
 
 static int comp_buffer(const void *a, const void *b){
@@ -1427,7 +1456,7 @@ static void *ftl_thread(void *arg)
              * How lazy this is set to is what decides how often a request ends
              * up waiting on a writeback, which is the effect being measured. */
             /* Scan only while no request is queued, so only a request arriving
-             * mid-batch waits (stats.ept_dirty_scan_delay_ns); before writeback
+             * mid-batch waits (stats.stall_ept_dirty_scan_ns); before writeback
              * so the lines it dirties go in the same pass. */
             if (ssd->cxl_req && !femu_ring_count(ssd->cxl_req))
                 buffer_scan_ept_dirty(buffer);
@@ -1451,7 +1480,7 @@ static void *ftl_thread(void *arg)
                 uint64_t arrival_ns = (uint64_t)creq->ncmd->stime;
                 if (arrival_ns >= buffer->ept_dirty_scan_last_start_ns &&
                     arrival_ns < buffer->ept_dirty_scan_last_end_ns)
-                    ssd->stats.ept_dirty_scan_delay_ns +=
+                    ssd->stats.stall_ept_dirty_scan_ns +=
                         buffer->ept_dirty_scan_last_end_ns - arrival_ns;
 
                 /* Must work regardless of LSA_TROLL, so this lives outside the switch below */

@@ -49,6 +49,12 @@ struct buffer_entry {
     /* Dirty because buffer_scan_ept_dirty() found a hit write, not because a
      * store trapped; cleared when the line turns clean. */
     bool dirtied_by_ept_scan;
+    /* When the line last became clean: at insertion, or at the background
+     * writeback that cleaned it. With cleaned_by_writeback, tells how long a
+     * line had been clean when a hit write found it; see
+     * stats.ept_dirty_found_by_clean_duration. */
+    uint64_t last_clean_time_ns;
+    bool cleaned_by_writeback;
     union {
         /*struct for CLOCK*/
         struct {
@@ -165,7 +171,7 @@ struct buffer {
     uint64_t ept_dirty_scan_batch;     /* LPNs checked per call; 0 = off */
     uint64_t ept_dirty_scan_lpn_cnt;   /* LPNs in the memslot, the scan range */
     /* Time span of the last scan batch. A request that arrived inside it
-     * waited until its end; see stats.ept_dirty_scan_delay_ns. */
+     * waited until its end; see stats.stall_ept_dirty_scan_ns. */
     uint64_t ept_dirty_scan_last_start_ns;
     uint64_t ept_dirty_scan_last_end_ns;
 

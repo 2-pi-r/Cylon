@@ -173,8 +173,11 @@ uint64_t buffer_insert_entry(struct buffer *b, struct buffer_entry *bentry, int 
 
 	// return false;
 	// printf("[FEMU CXL] Insert entry: lpn: %lx\n", bentry->lpn);
-	if (b->ops.insert_entry(b, bentry, &wait) > 0)
+	if (b->ops.insert_entry(b, bentry, &wait) > 0) {
 		bentry->insert_cnt_when_inserted = ++b->insert_cnt;
+		bentry->last_clean_time_ns = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+		bentry->cleaned_by_writeback = false;
+	}
 
 	/* prefetch */
 	/* TODO: prefetch not considered. */
@@ -190,8 +193,12 @@ uint64_t buffer_insert_entry(struct buffer *b, struct buffer_entry *bentry, int 
 			if (!pbentry) {
 				pbentry = buffer_entry_init(b, lpn);
 			}
-			if (b->ops.insert_entry(b, pbentry, &prefetch_wait) > 0)
+			if (b->ops.insert_entry(b, pbentry, &prefetch_wait) > 0) {
 				pbentry->insert_cnt_when_inserted = ++b->insert_cnt;
+				pbentry->last_clean_time_ns =
+					qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+				pbentry->cleaned_by_writeback = false;
+			}
 		}
 		(void)prefetch_wait;
 		// printf(">>> Done\n");
@@ -295,7 +302,9 @@ static void writeback_entry(struct buffer *b, struct buffer_entry *ent)
 	uint64_t lat = flush_pg(b->ssd, ent->lpn, WRITEBACK_SRC_BACKGROUND);
 
 	buffer_mark_dirty(b, ent, false);
-	ent->writeback_endtime = qemu_clock_get_ns(QEMU_CLOCK_REALTIME) + lat;
+	ent->last_clean_time_ns = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+	ent->cleaned_by_writeback = true;
+	ent->writeback_endtime = ent->last_clean_time_ns + lat;
 	/* The program just issued holds the hit writes recorded so far; left set,
 	 * the next EPT scan would dirty the line again for nothing. Some later hit
 	 * writes may go unrecorded, see femu_kvm_spte_clear_dirty(). */
@@ -360,6 +369,33 @@ void buffer_writeback_bg(struct buffer *b)
 	}
 }
 
+/* How long the line had been clean when the scan found it written, and how
+ * often this LPN gets found; see stats.ept_dirty_found_by_clean_duration. */
+static void count_found_clean_duration(struct buffer *b, struct buffer_entry *ent)
+{
+	struct ssd_stats *st = &b->ssd->stats;
+	uint64_t clean_ns = qemu_clock_get_ns(QEMU_CLOCK_REALTIME) -
+			    ent->last_clean_time_ns;
+	int since = ent->cleaned_by_writeback ? CLEAN_SINCE_WRITEBACK :
+					       CLEAN_SINCE_INSERT;
+	int bucket;
+
+	if (clean_ns < 10000000ULL)
+		bucket = CLEAN_DURATION_10MS;
+	else if (clean_ns < 100000000ULL)
+		bucket = CLEAN_DURATION_100MS;
+	else if (clean_ns < 1000000000ULL)
+		bucket = CLEAN_DURATION_1S;
+	else if (clean_ns < 10000000000ULL)
+		bucket = CLEAN_DURATION_10S;
+	else
+		bucket = CLEAN_DURATION_LONGER;
+	st->ept_dirty_found_by_clean_duration[since][bucket]++;
+
+	if (st->ept_dirty_found_cnt[ent->lpn] < UINT16_MAX)
+		st->ept_dirty_found_cnt[ent->lpn]++;
+}
+
 /* Mark dirty the cached lines the guest wrote through a cache hit.
  * Such writes never trap, so the EPT Dirty flag set by hardware is their only
  * trace. Checks a batch of LPNs per call so background writeback can take the
@@ -388,6 +424,7 @@ void buffer_scan_ept_dirty(struct buffer *b)
 			buffer_mark_dirty(b, ent, true);
 			ent->dirtied_by_ept_scan = true;
 			b->ssd->stats.ept_dirty_found_by_scan++;
+			count_found_clean_duration(b, ent);
 		}
 	}
 	b->ept_dirty_scan_last_end_ns = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
