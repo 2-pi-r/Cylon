@@ -386,6 +386,19 @@ static void ssd_init_stats(struct ssd *ssd)
                             SSD_STATS_SAMPLE_MAX);
 }
 
+/* Copy the counters the guest kernel needs into its shared page, if any.
+ * Runs at the stats sample period, often enough for the guest's minute-scale
+ * threshold update. */
+static void ssd_publish_shared_stats(struct ssd *ssd)
+{
+    struct cylon_shared_stats *shared = ssd->shared_stats;
+    uint64_t w_writeback = ssd->stats.w_writeback[WRITEBACK_SRC_BACKGROUND] +
+                           ssd->stats.w_writeback[WRITEBACK_SRC_FOREGROUND];
+
+    if (shared)
+        qatomic_set(&shared->w_writeback, cpu_to_le64(w_writeback));
+}
+
 /* Called once per CXL request rather than per page, to keep the period check
  * off the per-page write and GC paths. */
 static void ssd_stats_sample(struct ssd *ssd)
@@ -403,6 +416,9 @@ static void ssd_stats_sample(struct ssd *ssd)
         return;
     st->next_sample_w_writeback = w_writeback + SSD_STATS_SAMPLE_PERIOD;
     st->next_sample_reqs = reqs + SSD_STATS_SAMPLE_REQ_PERIOD;
+
+    /* Before the cap below: the guest needs updates for the whole run */
+    ssd_publish_shared_stats(ssd);
 
     if (st->nr_samples >= SSD_STATS_SAMPLE_MAX)
         return;
@@ -465,6 +481,9 @@ static void ssd_stats_reset(struct ssd *ssd)
      * measurement, not the device. */
     b->load_hit_trapped = b->load_miss = 0;
     b->store_hit_trapped = b->store_miss = 0;
+
+    /* The guest sees w_writeback drop and restarts its estimate */
+    ssd_publish_shared_stats(ssd);
 
     /* live_pages is current device state, not an event count, so it survives */
 }
@@ -1514,6 +1533,19 @@ static void *ftl_thread(void *arg)
                     rc = femu_ring_enqueue(ssd->cxl_resp, (void *)&creq, 1);
                     if (rc != 1) {
                         ftl_err("FTL cxl_resp enqueue failed (STATS)\n");
+                    }
+                    continue;
+                }
+
+                /* Switch the shared page here, between stores, so none lands
+                 * on a page the guest is about to free */
+                if (creq->ncmd->cmd == CXL_SHARED_STATS_SET) {
+                    ssd->shared_stats = ssd->shared_stats_next;
+                    ssd_publish_shared_stats(ssd);
+
+                    rc = femu_ring_enqueue(ssd->cxl_resp, (void *)&creq, 1);
+                    if (rc != 1) {
+                        ftl_err("FTL cxl_resp enqueue failed (SHARED_STATS)\n");
                     }
                     continue;
                 }

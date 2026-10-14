@@ -220,6 +220,7 @@ enum {
     CXL_TRIM,
     CXL_STATS_RESET,
     CXL_STATS_DUMP,
+    CXL_SHARED_STATS_SET,
 };
 
 /* Sampling periods, and the cap on samples held in memory. A read-dominated
@@ -414,6 +415,23 @@ struct cylon_trim_db {
     uint16_t src;        /* CYLON_TRIM_SRC_* */
 };
 
+/*
+ * Device counters the guest kernel reads without a VM exit. The guest registers
+ * one page of its RAM and the FTL thread stores into it at every stats sample.
+ * Each field is 8-byte aligned and written with a single store, so a guest read
+ * never sees a torn value.
+ */
+struct cylon_shared_stats {
+    uint64_t w_writeback;   /* host writebacks, both sources; drops on stats reset */
+};
+
+/* Doorbell payload that registers the shared page. page_pfn = 0 unregisters,
+ * which the guest must do before freeing the page. */
+struct cylon_shared_stats_db {
+    uint32_t page_pfn;
+    uint32_t reserved;
+};
+
 struct cxl_req {
     /* request */
     struct nand_cmd *ncmd;
@@ -467,6 +485,13 @@ struct ssd {
     struct buffer dram_buffer;
 
     struct ssd_stats stats;
+
+    /* Guest page counters are published into (NULL = none registered). Only
+     * the FTL thread touches it; the mailbox handler stages a new page in
+     * shared_stats_next and hands the switch over with CXL_SHARED_STATS_SET,
+     * so the FTL thread never stores into a page the guest is releasing. */
+    struct cylon_shared_stats *shared_stats;
+    struct cylon_shared_stats *shared_stats_next;
 
     bool *dataplane_started_ptr;
     QemuThread ftl_thread;

@@ -489,6 +489,10 @@ static void req_ftl_cmd(FemuCtrl *n, int c,
 #define CYLON_STATS_RESET_MAGIC 0x53545200ULL
 #define CYLON_STATS_DUMP_MAGIC  0x53544400ULL
 
+/* Same channel: register the guest page the FTL thread publishes counters
+ * into. Payload is a struct cylon_shared_stats_db. ("SHS\0") */
+#define CYLON_SHARED_STATS_MAGIC 0x53485300ULL
+
 /* One guest page worth of ranges */
 #define CYLON_TRIM_MAX_ENTS (4096 / (int)sizeof(struct cylon_trim_ent))
 
@@ -572,6 +576,52 @@ static uint16_t cxlssd_trim_dma(FemuCtrl *n, const void *buf, uint64_t size)
     }
 
     return cxlssd_trim_submit(n, trim_dma_buf, db->count, db->src);
+}
+
+/* Host mapping of the registered shared page, kept until it is replaced */
+static struct cylon_shared_stats *shared_stats_map;
+static dma_addr_t shared_stats_map_len;
+
+/*
+ * Map the guest page once so the FTL thread can store into it directly, with
+ * no DMA call per update. The page is ordinary guest RAM, so the mapping is a
+ * plain pointer that stays valid until unmapped.
+ */
+static uint16_t cxlssd_shared_stats_register(FemuCtrl *n, const void *buf,
+                                             uint64_t size)
+{
+    const struct cylon_shared_stats_db *db = buf;
+    struct cylon_shared_stats *new_page = NULL;
+    dma_addr_t len = sizeof(struct cylon_shared_stats);
+
+    if (size < sizeof(*db)) {
+        femu_err("SHARED_STATS: doorbell too small (%lu)\n", size);
+        return 0;
+    }
+
+    if (db->page_pfn) {
+        new_page = pci_dma_map(&n->parent_obj, (dma_addr_t)db->page_pfn << 12,
+                               &len, DMA_DIRECTION_FROM_DEVICE);
+        if (!new_page || len < sizeof(*new_page)) {
+            if (new_page)
+                pci_dma_unmap(&n->parent_obj, new_page, len,
+                              DMA_DIRECTION_FROM_DEVICE, 0);
+            femu_err("SHARED_STATS: map failed (pfn=0x%x)\n", db->page_pfn);
+            return 0;
+        }
+    }
+
+    /* Blocks until the FTL thread has switched, so the old page is no longer
+     * written to once this returns and can be unmapped */
+    n->ssd->shared_stats_next = new_page;
+    req_ftl_cmd(n, CXL_SHARED_STATS_SET, NULL, 0, 0);
+
+    if (shared_stats_map)
+        pci_dma_unmap(&n->parent_obj, shared_stats_map, shared_stats_map_len,
+                      DMA_DIRECTION_FROM_DEVICE, shared_stats_map_len);
+    shared_stats_map = new_page;
+    shared_stats_map_len = len;
+    return 0;
 }
 
 #ifdef LSA_TROLL
@@ -733,6 +783,9 @@ static uint16_t set_lsa(struct FemuCtrl *n, const void *buf, uint64_t size, uint
         req_ftl_cmd(n, CXL_STATS_DUMP, NULL, 0, 0);
         return 0;
     }
+
+    if (offset == CYLON_SHARED_STATS_MAGIC)
+        return cxlssd_shared_stats_register(n, buf, size);
 
 
     // if (size == 13) {
