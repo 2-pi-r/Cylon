@@ -57,6 +57,7 @@ struct buffer_entry *buffer_entry_init(struct buffer *b, lpn_t lpn)
     new->dirty = false;
     new->dirtied_by_ept_scan = false;
     new->writeback_endtime = 0;
+    new->fill_endtime = 0;
 
 	return new;
 }

@@ -41,6 +41,10 @@ struct buffer_entry {
      * though it is no longer dirty. Per-entry counterpart to
      * nand_lun.evict_endtime. */
     uint64_t writeback_endtime;
+    /* When the miss that inserted the line finishes its modelled wait (fill
+     * read plus victim writeback), 0 for a line inserted without one. Tells a
+     * trapped hit that it arrived mid-fill (stats.fill_inflight_hits). */
+    uint64_t fill_endtime;
     /* buffer->insert_cnt when the line was inserted. Its key in
      * buffer->dirty_tree; the gap to the current insert_cnt is how far it has
      * moved toward the FIFO head, see is_dirty_line_too_old(). Must not change

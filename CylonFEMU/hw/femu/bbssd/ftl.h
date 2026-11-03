@@ -320,6 +320,11 @@ struct ssd_stats {
     uint64_t stall_ns;
     uint64_t stall_cache_fill_ns;  /* waiting for the fill read */
     uint64_t stall_writeback_ns;   /* waiting for the victim's line to free up */
+    // uint64_t stall_fill_inflight_ns;
+    /* Trapped hits on a line still being filled for another vCPU's miss.
+     * Counted, not charged; see the hit path in ftl_thread(). Only possible
+     * once misses overlap. */
+    uint64_t fill_inflight_hits;
 
     /* Evictions that waited on an in-flight background writeback rather than
      * programming the page themselves. These call no flush_pg(), so they leave
@@ -445,8 +450,10 @@ struct cxl_req {
 
     /* response */
     uint64_t expire_time;
-
-    size_t pos;
+    /* Set last by the FTL thread, with release semantics. Each requester
+     * waits on its own flag, so requests from different vCPUs can be in
+     * flight at once. */
+    bool done;
 };
 
 struct ssd {
@@ -480,7 +487,6 @@ struct ssd {
     struct rte_ring **to_poller;
 
     struct rte_ring *cxl_req;
-    struct rte_ring *cxl_resp;
 
     struct buffer dram_buffer;
 

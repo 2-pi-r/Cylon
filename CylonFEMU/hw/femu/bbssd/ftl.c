@@ -459,6 +459,8 @@ static void ssd_stats_reset(struct ssd *ssd)
     st->gc_lines = st->gc_lines_forced = st->gc_forced_novictim = 0;
     st->r_cache_fill = st->r_cache_fill_store = st->r_gc = 0;
     st->stall_ns = st->stall_cache_fill_ns = st->stall_writeback_ns = 0;
+    // st->stall_fill_inflight_ns = 0;
+    st->fill_inflight_hits = 0;
     st->evict_inflight_waits = 0;
     st->w_writeback_bg_by_age = 0;
     st->writeback_bg_blocked_ns = st->die_backlog_max_ns = 0;
@@ -602,9 +604,10 @@ static void ssd_stats_dump(struct ssd *ssd)
     /* writeback_share is what this whole change exists to measure: before the
      * foreground-wait path existed it was 0 by construction. */
     ftl_log("stats stall_cache_fill_ns=%lu stall_writeback_ns=%lu "
-            "writeback_share=%.4f\n",
+            "writeback_share=%.4f fill_inflight_hits=%lu\n",
             st->stall_cache_fill_ns, st->stall_writeback_ns,
-            st->stall_ns ? (double)st->stall_writeback_ns / st->stall_ns : 0.0);
+            st->stall_ns ? (double)st->stall_writeback_ns / st->stall_ns : 0.0,
+            st->fill_inflight_hits);
 
     ftl_log("stats trim_pages report=%lu hook=%lu manual=%lu "
             "trim_cmds report=%lu hook=%lu manual=%lu\n",
@@ -1443,6 +1446,13 @@ static void ftl_trim(struct ssd *ssd, lpn_t lpn)
     buffer_remove_entry(&ssd->dram_buffer, lpn);
 }
 
+/* Hands @creq back to its requester, who may free it at once, so this must be
+ * the FTL thread's last access to it. */
+static inline void cxl_req_complete(struct cxl_req *creq)
+{
+    qatomic_store_release(&creq->done, true);
+}
+
 static void *ftl_thread(void *arg)
 {
     FemuCtrl *n = (FemuCtrl *)arg;
@@ -1461,7 +1471,6 @@ static void *ftl_thread(void *arg)
     ssd->to_poller = n->to_poller;
 
     ssd->cxl_req = n->cxl_req;
-    ssd->cxl_resp = n->cxl_resp;
 
     struct buffer *buffer = &ssd->dram_buffer;
 #ifdef LSA_TROLL    
@@ -1515,10 +1524,7 @@ static void *ftl_thread(void *arg)
                     }
                     ssd->stats.trim_cmds[src]++;
 
-                    rc = femu_ring_enqueue(ssd->cxl_resp, (void *)&creq, 1);
-                    if (rc != 1) {
-                        ftl_err("FTL cxl_resp enqueue failed (TRIM)\n");
-                    }
+                    cxl_req_complete(creq);
                     continue;
                 }
 
@@ -1530,10 +1536,7 @@ static void *ftl_thread(void *arg)
                     else
                         ssd_stats_dump(ssd);
 
-                    rc = femu_ring_enqueue(ssd->cxl_resp, (void *)&creq, 1);
-                    if (rc != 1) {
-                        ftl_err("FTL cxl_resp enqueue failed (STATS)\n");
-                    }
+                    cxl_req_complete(creq);
                     continue;
                 }
 
@@ -1543,10 +1546,7 @@ static void *ftl_thread(void *arg)
                     ssd->shared_stats = ssd->shared_stats_next;
                     ssd_publish_shared_stats(ssd);
 
-                    rc = femu_ring_enqueue(ssd->cxl_resp, (void *)&creq, 1);
-                    if (rc != 1) {
-                        ftl_err("FTL cxl_resp enqueue failed (SHARED_STATS)\n");
-                    }
+                    cxl_req_complete(creq);
                     continue;
                 }
 #ifdef LSA_TROLL
@@ -1571,7 +1571,7 @@ static void *ftl_thread(void *arg)
 
                 if (skip) {
                     skip = false;
-                    rc = femu_ring_enqueue(ssd->cxl_resp, (void *)&creq, 1);
+                    cxl_req_complete(creq);
                     continue;
                 }
 #endif
@@ -1582,7 +1582,23 @@ static void *ftl_thread(void *arg)
 
                 bentry = buffer_lookup_entry(buffer, lpn);
                 if (bentry) {//buffer hit
-                    rc = femu_ring_enqueue(ssd->cxl_resp, (void *)&creq, 1);
+                    /* The line may still be mid-fill for another vCPU's miss.
+                     * A real device would make this access wait for the rest,
+                     * but a direct access to the line then waits for nothing,
+                     * so charging only trapped ones would skew runs by how
+                     * often they happened to trap. Count it, charge nothing. */
+                    if (bentry->fill_endtime > creq->expire_time)
+                        ssd->stats.fill_inflight_hits++;
+                    // uint64_t fill_remaining_ns = 0;
+                    //
+                    // if (bentry->fill_endtime > creq->expire_time)
+                    //     fill_remaining_ns = bentry->fill_endtime - creq->expire_time;
+                    // if (fill_remaining_ns) {
+                    //     creq->expire_time += fill_remaining_ns;
+                    //     ssd->stats.stall_fill_inflight_ns += fill_remaining_ns;
+                    //     ssd->stats.stall_ns += fill_remaining_ns;
+                    // }
+                    cxl_req_complete(creq);
                     buffer_mark_dirty(buffer, bentry,
                                       (bentry->dirty==false && read)?false:true);
 
@@ -1649,7 +1665,8 @@ static void *ftl_thread(void *arg)
                     ssd->stats.stall_cache_fill_ns += lat;
                     ssd->stats.stall_writeback_ns += writeback_wait;
                     ssd->stats.stall_ns += lat + writeback_wait;
-                    rc = femu_ring_enqueue(ssd->cxl_resp, (void *)&creq, 1);
+                    bentry->fill_endtime = creq->expire_time;
+                    cxl_req_complete(creq);
                 }
                 /* clean one line if needed (in the background) */
                 if (should_gc(ssd)) {

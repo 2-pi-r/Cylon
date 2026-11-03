@@ -2,6 +2,9 @@
 #include "../nvme.h"
 #include "../bbssd/ftl.h"
 #include "../kvm_ext.h"
+#include "hw/core/cpu.h"
+#include "qemu/main-loop.h"
+#include "qemu/processor.h"
 FILE *mem_acc_log_file;
 
 static void cxlssd_init_ctrl_str(FemuCtrl *n)
@@ -11,32 +14,6 @@ static void cxlssd_init_ctrl_str(FemuCtrl *n)
     const char *vcxlssdssd_sn = "vSSD";
 
     nvme_set_ctrl_name(n, vcxlssdssd_mn, vcxlssdssd_sn, &fsid_vcxlssd);
-}
-
-
-static int cmp_pri(pqueue_pri_t next, pqueue_pri_t curr)
-{
-    return (next > curr);
-}
-
-static pqueue_pri_t get_pri(void *a)
-{
-    return ((struct cxl_req *)a)->expire_time;
-}
-
-static void set_pri(void *a, pqueue_pri_t pri)
-{
-    ((struct cxl_req *)a)->expire_time = pri;
-}
-
-static size_t get_pos(void *a)
-{
-    return ((struct cxl_req *)a)->pos;
-}
-
-static void set_pos(void *a, size_t pos)
-{
-    ((struct cxl_req *)a)->pos = pos;
 }
 
 
@@ -60,17 +37,7 @@ static void cxlssd_init(FemuCtrl *n, Error **errp)
         femu_err("Failed to create ring (n->cxl_req) ...\n");
         abort();
     }
-    n->cxl_resp = femu_ring_create(FEMU_RING_TYPE_MP_SC, FEMU_MAX_INF_REQS);
-    if (!n->cxl_resp) {
-        femu_err("Failed to create ring (n->cxl_resp) ...\n");
-        abort();
-    }
-    n->cxl_pq = pqueue_init(FEMU_MAX_INF_REQS, cmp_pri, get_pri, set_pri, get_pos, set_pos);
-    if (!n->cxl_pq) {
-        femu_err("Failed to create pqueue (n->cxl_pq) ...\n");
-        abort();
-    }
-    
+
     femu_kvm_set_user_memory_region(n);
     ssd_init(n);
 
@@ -84,9 +51,6 @@ static void cxlssd_exit(FemuCtrl *n)
 {
 
     femu_ring_free(n->cxl_req);
-    femu_ring_free(n->cxl_resp);
-
-    pqueue_free(n->cxl_pq);
 
     femu_kvm_del_user_memory_region(n);
     ssd_reset(n);
@@ -168,11 +132,49 @@ static uint16_t cxlssd_admin_cmd(FemuCtrl *n, NvmeCmd *cmd)
     }
 }
 
+/*
+ * Queues @creq for the FTL thread and spins until the FTL thread marks it
+ * done. The FTL thread still serves requests one at a time, but only for its
+ * bookkeeping; the modelled NAND time is waited out by the requester
+ * afterwards, so it can overlap with other vCPUs' requests.
+ */
+static void cxl_req_submit_and_wait(FemuCtrl *n, struct cxl_req *creq)
+{
+    if (femu_ring_enqueue(n->cxl_req, (void *)&creq, 1) != 1) {
+        femu_err("enqueue failed\n");
+    }
+    while (!qatomic_load_acquire(&creq->done)) {
+        cpu_relax();
+    }
+}
+
+/*
+ * Whether this access is the guest's own load/store that trapped on this
+ * page of the CXL window. Not for another device's DMA into CXL memory, or for
+ * an access made inside another device's MMIO handler: releasing the BQL there
+ * would let other threads change that device's state midway.
+ */
+static bool cxl_access_is_guest_mmio_exit(FemuCtrl *n, uint64_t addr)
+{
+    struct kvm_run *run;
+
+    if (!current_cpu || !qemu_mutex_iothread_locked()) {
+        return false;
+    }
+    run = current_cpu->kvm_run;
+    return run && run->exit_reason == KVM_EXIT_MMIO &&
+           (run->mmio.phys_addr >> 12) == ((n->base_gpa + addr) >> 12);
+}
+
 static void wait_for_buf_update(FemuCtrl *n, uint64_t addr, int c)
 {
-    int rc;
     uint64_t now = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
-    lpn_t lpn = addr >> 12;
+    /*
+     * Release the BQL for the modelled NAND time. QEMU takes it for every MMIO
+     * access, so holding it here made the misses of all vCPUs queue up behind
+     * one another and none of the device's die parallelism was ever used.
+     */
+    bool release_bql = cxl_access_is_guest_mmio_exit(n, addr);
 
     struct nand_cmd cmd = (struct nand_cmd) {
         .type = USER_IO,
@@ -182,113 +184,20 @@ static void wait_for_buf_update(FemuCtrl *n, uint64_t addr, int c)
 
     struct cxl_req creq = (struct cxl_req) {
         .ncmd = &cmd,
-        .lpn = lpn,
+        .lpn = addr >> 12,
         .expire_time = now,
     };
 
-    struct cxl_req *myreq = malloc(sizeof(struct cxl_req));
-    memcpy(myreq, &creq, sizeof(struct cxl_req));
-    // &creq;
-    struct cxl_req *req = NULL;
-
-    /* send requesst*/
-    // qemu_mutex_lock(&n->mutex);
-    rc = femu_ring_enqueue(n->cxl_req, (void *)&myreq, 1);
-    // qemu_mutex_unlock(&n->mutex);
-    if (rc != 1) {
-        femu_err("enqueue failed, ret=%d\n", rc);
+    if (release_bql) {
+        qemu_mutex_unlock_iothread();
     }
-    
-    pqueue_t *pq = n->cxl_pq;
-    struct rte_ring *rp = n->cxl_resp;
-    bool recvd = false;
-
-    
-    // if (qemu_mutex_trylock(&n->mutex)) {
-    //     qemu_mutex_unlock(&n->mutex);
-    // }
-    // else {
-    //     femu_err("[tid %d]: Failed to lock mutex, cannot wait for buf update\n", gettid());
-    // }
-
-
-    // while (!recvd) {
-    //     /* flush response Q */
-    //     while (true) {
-    //         qemu_mutex_lock(&n->mutex);
-    //         if (femu_ring_count(rp) == 0) {
-    //             qemu_mutex_unlock(&n->mutex);
-    //             break;
-    //         }
-
-    //         req = NULL;
-    //         rc = femu_ring_dequeue(rp, (void *)&req, 1);
-    //         if (rc != 1) {
-    //             femu_err("dequeue from to_poller request failed\n");
-    //         }
-    //         assert(req);
-    
-    //         pqueue_insert(pq, req);
-    //         qemu_mutex_unlock(&n->mutex);
-    //     }
-
-    //     /* Wait for my response */
-    //     while (true) {
-            
-    //         qemu_mutex_lock(&n->mutex);
-    //         req = pqueue_peek(pq);
- 
-    //         if (myreq != req) {
-    //             qemu_mutex_unlock(&n->mutex);
-    //             continue;
-    //         }
-            
-    //         recvd = true;
-    //         pqueue_pop(pq);
-    //         qemu_mutex_unlock(&n->mutex);
-            
-    //         do {
-    //             now = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);  
-    //         } while(now < req->expire_time);
-
-    //         break;
-    //     }
-    // }
-    
-
-    while (!recvd) {
-        /* flush response Q */
-        while (femu_ring_count(rp)) {
-            
-            req = NULL;
-            rc = femu_ring_dequeue(rp, (void *)&req, 1);
-            if (rc != 1) {
-                femu_err("dequeue from to_poller request failed\n");
-            }
-            assert(req);
-    
-            pqueue_insert(pq, req);
-        }
-
-        /* Wait for my response */
-        while ((req = pqueue_peek(pq))) {
-            if (myreq != req) {
-                continue;
-            }
-            
-            recvd = true;
-            pqueue_pop(pq);
-            do {
-                now = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);  
-            } while(now < req->expire_time);
-
-            // printf("addr 0x%lx, start: %ld, end: %ld, duration: %ld, actual: %ld\n", addr, creq.expire_time, req->expire_time, req->expire_time-creq.expire_time, now-creq.expire_time);
-            break;
-        }
+    cxl_req_submit_and_wait(n, &creq);
+    while (qemu_clock_get_ns(QEMU_CLOCK_REALTIME) < creq.expire_time) {
+        cpu_relax();
     }
-    
-
-    free(myreq);
+    if (release_bql) {
+        qemu_mutex_lock_iothread();
+    }
 }
 
 // #include <execinfo.h>
@@ -422,7 +331,6 @@ static MemTxResult cxlssd_mem_write(void *opaque, uint64_t addr, uint64_t data, 
 static void req_ftl_cmd(FemuCtrl *n, int c,
                         const struct cylon_trim_ent *ents, int cnt, int src)
 {
-    int rc;
     struct nand_cmd cmd = (struct nand_cmd) {
         .type = USER_IO,
         .cmd = c,
@@ -438,42 +346,8 @@ static void req_ftl_cmd(FemuCtrl *n, int c,
         .expire_time = 0,
     };
 
-    struct cxl_req *myreq = &creq;
-    struct cxl_req *req = NULL;
-
-    /* send requesst*/
-    rc = femu_ring_enqueue(n->cxl_req, (void *)&myreq, 1);
-    if (rc != 1) {
-        femu_err("enqueue failed, ret=%d\n", rc);
-    }
-
-    pqueue_t *pq = n->cxl_pq;
-    struct rte_ring *rp = n->cxl_resp;
-    bool recvd = false;
-
-    while (!recvd) {
-        /* flush response Q */
-        while (femu_ring_count(rp)) {
-            req = NULL;
-            rc = femu_ring_dequeue(rp, (void *)&req, 1);
-            if (rc != 1) {
-                femu_err("dequeue from to_poller request failed\n");
-            }
-            assert(req);
-            
-            pqueue_insert(pq, req);
-        }
-
-        /* Wait for my response */
-        while ((req = pqueue_peek(pq))) {
-            if (myreq != req)
-                continue;
-
-            recvd = true;
-            pqueue_pop(pq);
-            break;
-        }
-    }
+    /* Keeps the BQL: trim_dma_buf below relies on it. */
+    cxl_req_submit_and_wait(n, &creq);
 }
 
 /*
