@@ -339,6 +339,8 @@ struct x86_emulate_ctxt {
 	u8 rex_prefix;
 	u8 lock_prefix;
 	u8 rep_prefix;
+	/* Cylon: this instruction read the FEMU (dual-mode) slot through MMIO */
+	bool dual_mode_mmio_read;
 	/* bitmaps of registers in _regs[] that can be read */
 	u16 regs_valid;
 	/* bitmaps of registers in _regs[] that have been written */

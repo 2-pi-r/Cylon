@@ -7643,6 +7643,12 @@ static int emulator_read_write_onepage(unsigned long addr, void *val,
 		return X86EMUL_CONTINUE;
 		
 	// }
+	/* Cylon: lets a rep string read return to the guest, see x86_emulate_insn() */
+	if (!write) {
+		struct kvm_memory_slot *slot = kvm_vcpu_gfn_to_memslot(vcpu, gpa >> PAGE_SHIFT);
+		if (slot && (slot->flags & KVM_MEMSLOT_DUAL_MODE))
+			ctxt->dual_mode_mmio_read = true;
+	}
 	/*
 	 * Is this MMIO handled locally?
 	 */

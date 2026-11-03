@@ -5358,6 +5358,7 @@ void init_decode_cache(struct x86_emulate_ctxt *ctxt)
 	ctxt->rex_prefix = 0;
 	ctxt->lock_prefix = 0;
 	ctxt->rep_prefix = 0;
+	ctxt->dual_mode_mmio_read = false;
 	ctxt->regs_valid = 0;
 	ctxt->regs_dirty = 0;
 
@@ -5629,8 +5630,12 @@ writeback:
 			/*
 			 * Re-enter guest when pio read ahead buffer is empty
 			 * or, if it is not used, after each 1024 iteration.
+			 * Cylon: also after a FEMU slot read. FEMU maps the page directly
+			 * once it serves the read, but the MMIO cache would still send
+			 * every remaining iteration to FEMU; the guest runs them natively.
 			 */
-			if ((r->end != 0 || reg_read(ctxt, VCPU_REGS_RCX) & 0x3ff) &&
+			if (!ctxt->dual_mode_mmio_read &&
+			    (r->end != 0 || reg_read(ctxt, VCPU_REGS_RCX) & 0x3ff) &&
 			    (r->end == 0 || r->end != r->pos)) {
 				/*
 				 * Reset read cache. Usually happens before
