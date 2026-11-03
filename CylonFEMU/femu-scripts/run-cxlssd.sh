@@ -165,6 +165,7 @@ echo never | sudo tee /sys/kernel/mm/transparent_hugepage/enabled
 n_threads=8
 dram_size=16G
 
+ip tuntap add dev tap0 mode tap 2>/dev/null; ip addr add 192.168.100.1/24 dev tap0 2>/dev/null; ip link set tap0 up
 sudo x86_64-softmmu/qemu-system-x86_64 \
     -name "FEMU-CXLSSD-VM" \
 -netdev tap,id=net1,ifname=tap0,script=no,downscript=no \
