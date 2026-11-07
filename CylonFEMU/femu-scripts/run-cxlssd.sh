@@ -2,7 +2,7 @@
 # Huaicheng Li <huaicheng@cs.uchicago.edu>
 # Run FEMU with no SSD emulation logic, (e.g., for SCM/Optane emulation)
 if [[ ! -e "$1" ]]; then
-    echo "usage: $0 [ssd_size (MB)]"
+    echo "usage: $0 [ssd_size (MB)] [DRAM cache size (MB), default ssd_size/250]"
 fi
 
 # Virtual machine disk image
@@ -36,7 +36,9 @@ ept_dirty_scan_batch=512     # LPNs whose EPT dirty bit is checked per idle FTL 
 
 # Configurable SSD Controller layout parameters (must be power of 2)
 ssd_size=$1		# in MegaBytes
-bufsz=$((ssd_size/250)) #1 # 20480 # $((ssd_size/20))
+# DRAM cache only; FTL and other device metadata are allocated separately, so a run that adds
+# device metadata must pass a smaller cache size here to keep the device DRAM total fair.
+bufsz=${2:-$((ssd_size/250))} #1 # 20480 # $((ssd_size/20))
 skip_ftl=0
 
 
@@ -62,11 +64,11 @@ if [ $ssd_size -eq 49152 ]
 then
     secsz=512		
     secs_per_pg=8
-    pgs_per_blk=256
+    pgs_per_blk=4096 #256
     blks_per_pl=983     # OP (blks_per_pl > ssd_size)
     pls_per_lun=1       # still not support multiplanes		
-    luns_per_ch=8		
-    nchs=8  			
+    luns_per_ch=2 #8		
+    nchs=2 #8  			
 fi
 
 # 40GB (raw ~52.4GB, OP ~28%)
@@ -89,11 +91,11 @@ if [ $ssd_size -eq 65536 ]
 then
     secsz=512
     secs_per_pg=8
-    pgs_per_blk=256
+    pgs_per_blk=4096 #256
     blks_per_pl=1311    # OP (blks_per_pl > ssd_size)
     pls_per_lun=1       # still not support multiplanes
-    luns_per_ch=8
-    nchs=8
+    luns_per_ch=2 #8
+    nchs=2 #8
 fi
 
 # 32GB (raw ~41GB, OP 28%)
